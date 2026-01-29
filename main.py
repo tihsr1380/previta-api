@@ -1,5 +1,5 @@
 import os
-import psycopg2
+import psycopg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -20,7 +20,7 @@ class VitalIn(BaseModel):
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada.")
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL)
 
 @app.get("/health")
 def health():
@@ -62,3 +62,4 @@ def ingest_vital(v: VitalIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
