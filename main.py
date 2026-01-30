@@ -98,21 +98,26 @@ def ingest_vital(v: VitalIn):
 
 from datetime import datetime, timedelta
 
-def calc_risk(row: dict):
-    # score base
+def calc_risk(row: dict, history: list[dict]):
     score = 0
     reasons = []
 
+    def delta(field):
+        values = [h.get(field) for h in history if h.get(field) is not None]
+        if len(values) < 2:
+            return 0
+        return values[-1] - values[0]
+
+    # ===== Estado atual =====
     temp = row.get("temp")
     pas  = row.get("pas")
-    pad  = row.get("pad")
     fc   = row.get("fc")
     fr   = row.get("fr")
     spo2 = row.get("spo2")
-    nivel = (row.get("nivel_consciencia") or "").strip().lower()
-    uso_o2 = (row.get("uso_o2") or "").strip().lower()
+    nivel = (row.get("nivel_consciencia") or "").lower()
+    uso_o2 = (row.get("uso_o2") or "").lower()
 
-    # Regras (versão v1 - simples e segura)
+    # Regras pontuais (como antes)
     if spo2 is not None and spo2 < 92:
         score += 40
         reasons.append(f"SpO2 baixa ({spo2})")
@@ -133,28 +138,49 @@ def calc_risk(row: dict):
         score += 30
         reasons.append(f"PAS baixa ({pas})")
 
-    # Alerta neurológico
-    if nivel in ["sonolenta", "confuso", "rebaixado", "inconsciente"]:
+    if nivel in ["sonolenta", "confuso", "rebaixado"]:
         score += 30
-        reasons.append(f"Nível consciência: {nivel}")
+        reasons.append(f"Consciência alterada ({nivel})")
 
-    # Uso de O2 e SpO2 baixa piora
-    if (uso_o2 in ["aa", "sim", "cateter", "mascara"]) and (spo2 is not None and spo2 < 94):
+    # ===== Tendências =====
+    if delta("spo2") <= -3:
+        score += 25
+        reasons.append("Queda progressiva de SpO2")
+
+    if delta("fc") >= 15:
+        score += 15
+        reasons.append("Aumento progressivo de FC")
+
+    if delta("fr") >= 5:
+        score += 15
+        reasons.append("Aumento progressivo de FR")
+
+    if delta("pas") <= -20:
+        score += 20
+        reasons.append("Queda progressiva de PAS")
+
+    if delta("temp") >= 1:
         score += 10
-        reasons.append("Uso O2 + SpO2 <94")
+        reasons.append("Elevação progressiva de temperatura")
 
-    # Define nível
-    if score >= 60:
+    # Uso de O2 + tendência respiratória
+    if uso_o2 in ["aa", "sim"] and delta("spo2") < 0:
+        score += 10
+        reasons.append("Uso de O2 + queda de SpO2")
+
+    # Classificação final
+    if score >= 70:
         level = "ALTO"
-    elif score >= 30:
+    elif score >= 35:
         level = "MODERADO"
     else:
         level = "BAIXO"
 
     if not reasons:
-        reasons = ["Sem sinais críticos pelas regras v1"]
+        reasons = ["Sem sinais críticos ou tendências relevantes"]
 
     return level, min(score, 100), " | ".join(reasons)
+
 
 
 @app.post("/v1/risk/run")
@@ -274,4 +300,5 @@ def alerts_check(p: AlertsIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
