@@ -13,7 +13,18 @@ class VitalIn(BaseModel):
     data_lanc: str          # "2026-01-28"
     hora: int               # 0-23
     minuto: int             # 0-59
+
+    # vitais
     temp: float | None = None
+    pas: float | None = None
+    pad: float | None = None
+    fc: float | None = None
+    fr: float | None = None
+    spo2: float | None = None
+    dor: float | None = None
+    uso_o2: str | None = None
+    nivel_consciencia: str | None = None
+
     profissional: str | None = None
     event_ts: str           # "2026-01-28T04:15:00"
 
@@ -34,13 +45,25 @@ def ingest_vital(v: VitalIn):
 
         cur.execute("""
             INSERT INTO public.vitals_raw
-              (event_ts, cod_atendimento, id_ricadpac, data_lanc, hora_lanc, minuto_lanc, temp, profissional)
+              (event_ts, cod_atendimento, id_ricadpac, data_lanc, hora_lanc, minuto_lanc,
+               temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia,
+               profissional)
             VALUES
-              (%s, %s, %s, %s, %s, %s, %s, %s)
+              (%s, %s, %s, %s, %s, %s,
+               %s, %s, %s, %s, %s, %s, %s, %s, %s,
+               %s)
             ON CONFLICT (cod_atendimento, data_lanc, hora_lanc, minuto_lanc)
             DO UPDATE SET
               event_ts = EXCLUDED.event_ts,
               temp = EXCLUDED.temp,
+              pas = EXCLUDED.pas,
+              pad = EXCLUDED.pad,
+              fc = EXCLUDED.fc,
+              fr = EXCLUDED.fr,
+              spo2 = EXCLUDED.spo2,
+              dor = EXCLUDED.dor,
+              uso_o2 = EXCLUDED.uso_o2,
+              nivel_consciencia = EXCLUDED.nivel_consciencia,
               profissional = EXCLUDED.profissional,
               updated_at = CURRENT_TIMESTAMP;
         """, (
@@ -50,7 +73,17 @@ def ingest_vital(v: VitalIn):
             v.data_lanc,
             v.hora,
             v.minuto,
+
             v.temp,
+            v.pas,
+            v.pad,
+            v.fc,
+            v.fr,
+            v.spo2,
+            v.dor,
+            v.uso_o2,
+            v.nivel_consciencia,
+
             v.profissional
         ))
 
@@ -62,4 +95,3 @@ def ingest_vital(v: VitalIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
