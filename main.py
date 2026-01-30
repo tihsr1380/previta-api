@@ -226,3 +226,52 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+from typing import Optional
+
+class AlertsIn(BaseModel):
+    minutes_back: int = 60
+    min_level: str = "MODERADO"  # MODERADO ou ALTO
+
+@app.post("/v1/alerts/check")
+def alerts_check(p: AlertsIn):
+    """
+    Varre risk_events recentes e grava alertas em public.alerts
+    (sem duplicar: UNIQUE(cod_atendimento, risk_level, event_ts)).
+    """
+    level_rank = {"BAIXO": 1, "MODERADO": 2, "ALTO": 3}
+    min_rank = level_rank.get(p.min_level.upper(), 2)
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT event_ts, cod_atendimento, risk_level, risk_score, risk_reason
+            FROM public.risk_events
+            WHERE event_ts >= (NOW() - (%s || ' minutes')::interval)
+            ORDER BY event_ts DESC
+        """, (p.minutes_back,))
+        rows = cur.fetchall()
+
+        inserted = 0
+        for (event_ts, cod_atendimento, risk_level, risk_score, risk_reason) in rows:
+            if level_rank.get((risk_level or "").upper(), 0) < min_rank:
+                continue
+
+            cur.execute("""
+                INSERT INTO public.alerts (event_ts, cod_atendimento, risk_level, risk_score, risk_reason)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (cod_atendimento, risk_level, event_ts) DO NOTHING
+            """, (event_ts, cod_atendimento, risk_level, risk_score, risk_reason))
+            if cur.rowcount == 1:
+                inserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "inserted": inserted, "scanned": len(rows)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
