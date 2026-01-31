@@ -1544,25 +1544,39 @@ async def notify_telegram_run(
                 # gatilho por created_at => evita “lançamento retroativo” reabrir alerta velho
                 cur.execute("""
                     SELECT
-                      id,
-                      cod_atendimento,
-                      snapshot_ts,
-                      recommendation_level,
-                      syndrome,
-                      confidence,
-                      actions,
-                      recommendation,
-                      state,
-                      trend_state
-                    FROM public.clinical_recommendations
-                    WHERE created_at >= (NOW() - (%s || ' minutes')::interval)
-                      AND status = 'NOVO'
-                      AND recommendation_level IN ('IMEDIATO','PRIORIDADE')
-                    ORDER BY
-                      CASE recommendation_level WHEN 'IMEDIATO' THEN 2 ELSE 1 END DESC,
-                      confidence DESC NULLS LAST,
-                      created_at ASC
-                    LIMIT %s;
+  cr.id,
+  cr.cod_atendimento,
+  cr.snapshot_ts,
+  cr.state,
+  cr.trend_state,
+  cr.recommendation_level,
+  cr.recommendation,
+  cr.syndrome,
+  cr.actions,
+  cr.confidence
+FROM clinical_recommendations cr
+WHERE
+(
+  -- REGRA 1: SEMPRE ENVIAR CRÍTICO
+  cr.state = 'CRITICO'
+
+  OR
+
+  -- REGRA 2: PRIORIDADE / IMEDIATO (controle normal)
+  (
+    cr.recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+    AND cr.notified_at IS NULL
+  )
+)
+ORDER BY
+  CASE
+    WHEN cr.state = 'CRITICO' THEN 2
+    ELSE 1
+  END DESC,
+  cr.confidence DESC,
+  cr.snapshot_ts DESC
+LIMIT :max_send;
+
                 """, (minutes_back, max_send))
 
                 rows = cur.fetchall()
@@ -1620,3 +1634,4 @@ async def notify_telegram_run(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
