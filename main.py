@@ -1514,124 +1514,87 @@ def dispatch_mark(p: DispatchMarkIn):
 # ============================================================
 @app.post("/v1/notify/telegram/run")
 async def notify_telegram_run(
-    minutes_back: int = 720,  # janela do "novo" pelo created_at
+    minutes_back: int = 180,
     max_send: int = 10,
     x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
-    _require_telegram()
+    _require_env()
 
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # anti-duplicação
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public.alert_notifications (
-                      id bigserial PRIMARY KEY,
-                      cod_atendimento int NOT NULL,
-                      snapshot_ts timestamptz NOT NULL,
-                      channel text NOT NULL DEFAULT 'TELEGRAM',
-                      sent_at timestamptz NOT NULL DEFAULT now(),
-                      status text NOT NULL DEFAULT 'SENT',
-                      response text NULL
-                    );
-                """)
-                cur.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_alert_notifications
-                    ON public.alert_notifications (cod_atendimento, snapshot_ts, channel);
-                """)
+        conn = get_conn()
+        cur = conn.cursor()
 
-                # gatilho por created_at => evita “lançamento retroativo” reabrir alerta velho
-                cur.execute("""
-                    SELECT
-  cr.id,
-  cr.cod_atendimento,
-  cr.snapshot_ts,
-  cr.state,
-  cr.trend_state,
-  cr.recommendation_level,
-  cr.recommendation,
-  cr.syndrome,
-  cr.actions,
-  cr.confidence
-FROM clinical_recommendations cr
-WHERE
-(
-  -- REGRA 1: SEMPRE ENVIAR CRÍTICO
-  cr.state = 'CRITICO'
+        # 🔎 REGRA FINAL:
+        # - IMEDIATO → envia SEMPRE
+        # - PRIORIDADE → só se ainda não foi notificado
+        cur.execute("""
+            SELECT
+              cod_atendimento,
+              snapshot_ts,
+              recommendation_level,
+              syndrome,
+              confidence,
+              actions
+            FROM public.clinical_recommendations
+            WHERE
+              snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+              AND recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+              AND (
+                recommendation_level = 'IMEDIATO'
+                OR notified_at IS NULL
+              )
+            ORDER BY
+              CASE recommendation_level
+                WHEN 'IMEDIATO' THEN 2
+                ELSE 1
+              END DESC,
+              confidence DESC
+            LIMIT %s;
+        """, (minutes_back, max_send))
 
-  OR
+        rows = cur.fetchall()
 
-  -- REGRA 2: PRIORIDADE / IMEDIATO (controle normal)
-  (
-    cr.recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
-    AND cr.notified_at IS NULL
-  )
-)
-ORDER BY
-  CASE
-    WHEN cr.state = 'CRITICO' THEN 2
-    ELSE 1
-  END DESC,
-  cr.confidence DESC,
-  cr.snapshot_ts DESC
-LIMIT :max_send;
+        sent = 0
 
-                """, (minutes_back, max_send))
+        for cod_atendimento, snapshot_ts, level, syndrome, confidence, actions in rows:
+            msg = (
+                f"🚨 <b>PREVITA ALERTA {level}</b>\n"
+                f"🧾 <b>Atendimento:</b> {cod_atendimento}\n"
+                f"🕒 <b>Snapshot:</b> {snapshot_ts}\n"
+                f"🧠 <b>Síndrome:</b> {syndrome or '-'}\n"
+                f"📌 <b>Confiança:</b> {confidence or '-'}\n\n"
+                f"✅ <b>Ações:</b>\n{(actions or '').strip()[:3500]}"
+            )
 
-                rows = cur.fetchall()
-                found = len(rows)
+            send_telegram_message(msg)
 
-                sent = 0
-                skipped = 0
+            # ⚠️ Só marca notified_at se NÃO for IMEDIATO
+            cur.execute("""
+                UPDATE public.clinical_recommendations
+                SET notified_at = CASE
+                  WHEN recommendation_level != 'IMEDIATO'
+                  THEN CURRENT_TIMESTAMP
+                  ELSE notified_at
+                END
+                WHERE cod_atendimento = %s
+                  AND snapshot_ts = %s;
+            """, (cod_atendimento, snapshot_ts))
 
-                for r in rows:
-                    # reserva no log anti-duplicação
-                    cur.execute("""
-                        INSERT INTO public.alert_notifications (cod_atendimento, snapshot_ts, channel)
-                        VALUES (%s, %s, 'TELEGRAM')
-                        ON CONFLICT (cod_atendimento, snapshot_ts, channel) DO NOTHING;
-                    """, (r["cod_atendimento"], r["snapshot_ts"]))
+            sent += 1
 
-                    if cur.rowcount == 0:
-                        skipped += 1
-                        continue
+        conn.commit()
+        cur.close()
+        conn.close()
 
-                    msg = (
-                        f"🚨 <b>PREVITA – ALERTA {r['recommendation_level']}</b>\n\n"
-                        f"🆔 <b>Atendimento:</b> {r['cod_atendimento']}\n"
-                        f"📌 <b>Estado:</b> {r.get('state') or '-'} / {r.get('trend_state') or '-'}\n"
-                        f"🧩 <b>Síndrome:</b> {r.get('syndrome') or '-'}\n"
-                        f"🧠 <b>Confiança:</b> {r.get('confidence') or '-'}\n"
-                        f"⏱️ <b>Snapshot:</b> {r['snapshot_ts']}\n\n"
-                        f"📣 <b>Recomendação:</b>\n{(r.get('recommendation') or '').strip()[:1200]}\n\n"
-                        f"✅ <b>Ações:</b>\n{(r.get('actions') or '').strip()[:2500]}"
-                    )
+        return {
+            "ok": True,
+            "found": len(rows),
+            "sent": sent
+        }
 
-                    tg_resp = await send_telegram_message_async(msg)
-
-                    # salva resp do telegram
-                    cur.execute("""
-                        UPDATE public.alert_notifications
-                        SET response = %s
-                        WHERE cod_atendimento=%s AND snapshot_ts=%s AND channel='TELEGRAM';
-                    """, (str(tg_resp)[:2000], r["cod_atendimento"], r["snapshot_ts"]))
-
-                    # marca como notificado (para consumo interno)
-                    cur.execute("""
-                        UPDATE public.clinical_recommendations
-                        SET notified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s;
-                    """, (r["id"],))
-
-                    sent += 1
-
-            conn.commit()
-
-        return {"ok": True, "found": found, "sent": sent, "skipped_already_sent": skipped}
-
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
