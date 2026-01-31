@@ -2,11 +2,17 @@ import os
 import psycopg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from datetime import datetime, timedelta
+from typing import Optional
 
 app = FastAPI(title="PREVITA API", version="1.0.0")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+
+# =========================
+# MODELS
+# =========================
 class VitalIn(BaseModel):
     cod_atendimento: int
     id_ricadpac: int | None = None
@@ -28,15 +34,32 @@ class VitalIn(BaseModel):
     profissional: str | None = None
     event_ts: str           # "2026-01-28T04:15:00"
 
+
+class AlertsIn(BaseModel):
+    minutes_back: int = 60
+    min_level: str = "MODERADO"  # MODERADO ou ALTO
+
+
+# =========================
+# DB
+# =========================
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada.")
     return psycopg.connect(DATABASE_URL)
 
+
+# =========================
+# HEALTH
+# =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
+# =========================
+# INGEST VITALS
+# =========================
 @app.post("/v1/vitals")
 def ingest_vital(v: VitalIn):
     try:
@@ -96,8 +119,10 @@ def ingest_vital(v: VitalIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-from datetime import datetime, timedelta
 
+# =========================
+# RISK ENGINE (STATE + TRENDS)
+# =========================
 def calc_risk(row: dict, history: list[dict]):
     score = 0
     reasons = []
@@ -117,7 +142,7 @@ def calc_risk(row: dict, history: list[dict]):
     nivel = (row.get("nivel_consciencia") or "").lower()
     uso_o2 = (row.get("uso_o2") or "").lower()
 
-    # Regras pontuais (como antes)
+    # Regras pontuais
     if spo2 is not None and spo2 < 92:
         score += 40
         reasons.append(f"SpO2 baixa ({spo2})")
@@ -142,26 +167,26 @@ def calc_risk(row: dict, history: list[dict]):
         score += 30
         reasons.append(f"Consciência alterada ({nivel})")
 
-    # ===== Tendências =====
+    # ===== Tendências (últimas 6h) =====
     if delta("spo2") <= -3:
         score += 25
-        reasons.append("Queda progressiva de SpO2")
+        reasons.append("Queda progressiva de SpO2 (6h)")
 
     if delta("fc") >= 15:
         score += 15
-        reasons.append("Aumento progressivo de FC")
+        reasons.append("Aumento progressivo de FC (6h)")
 
     if delta("fr") >= 5:
         score += 15
-        reasons.append("Aumento progressivo de FR")
+        reasons.append("Aumento progressivo de FR (6h)")
 
     if delta("pas") <= -20:
         score += 20
-        reasons.append("Queda progressiva de PAS")
+        reasons.append("Queda progressiva de PAS (6h)")
 
     if delta("temp") >= 1:
         score += 10
-        reasons.append("Elevação progressiva de temperatura")
+        reasons.append("Elevação progressiva de temperatura (6h)")
 
     # Uso de O2 + tendência respiratória
     if uso_o2 in ["aa", "sim"] and delta("spo2") < 0:
@@ -182,13 +207,16 @@ def calc_risk(row: dict, history: list[dict]):
     return level, min(score, 100), " | ".join(reasons)
 
 
-
+# =========================
+# RISK RUN (APLICA ETAPA 4.3)
+# =========================
 @app.post("/v1/risk/run")
 def run_risk(minutes_back: int = 60, limit: int = 500):
     try:
         conn = get_conn()
         cur = conn.cursor()
 
+        # pega leituras recentes
         cur.execute("""
             SELECT event_ts, cod_atendimento, id_ricadpac,
                    temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia
@@ -217,7 +245,30 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
                 "nivel_consciencia": r[11],
             }
 
-            level, score, reason = calc_risk(row)
+            # =========================
+            # ETAPA 4.3: BUSCA HISTÓRICO 6H DO MESMO ATENDIMENTO
+            # =========================
+            cur.execute("""
+                SELECT temp, pas, fc, fr, spo2
+                FROM public.vitals_raw
+                WHERE cod_atendimento = %s
+                  AND event_ts >= (%s - interval '6 hours')
+                ORDER BY event_ts ASC
+            """, (row["cod_atendimento"], row["event_ts"]))
+
+            history_rows = cur.fetchall()
+            history = []
+            for h in history_rows:
+                history.append({
+                    "temp": h[0],
+                    "pas": h[1],
+                    "fc": h[2],
+                    "fr": h[3],
+                    "spo2": h[4]
+                })
+
+            # agora calcula risco com tendência
+            level, score, reason = calc_risk(row, history)
 
             cur.execute("""
                 INSERT INTO public.risk_events
@@ -252,12 +303,9 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-from typing import Optional
-
-class AlertsIn(BaseModel):
-    minutes_back: int = 60
-    min_level: str = "MODERADO"  # MODERADO ou ALTO
-
+# =========================
+# ALERTS CHECK
+# =========================
 @app.post("/v1/alerts/check")
 def alerts_check(p: AlertsIn):
     """
@@ -300,5 +348,3 @@ def alerts_check(p: AlertsIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
