@@ -212,17 +212,24 @@ def calc_risk(row: dict, history: list[dict]):
 # =========================
 @app.post("/v1/risk/run")
 def run_risk(minutes_back: int = 60, limit: int = 500):
+    """
+    Calcula risco usando a tabela public.vitals_snapshot (último valor não-nulo por vital),
+    e grava em public.risk_events (upsert por cod_atendimento + event_ts).
+    """
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # pega leituras recentes
+        # Busca snapshots recentes (mais confiável do que vitals_raw linha-a-linha)
         cur.execute("""
-            SELECT event_ts, cod_atendimento, id_ricadpac,
+            SELECT snapshot_ts, cod_atendimento, id_ricadpac,
                    temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia
-            FROM public.vitals_raw
-            WHERE event_ts >= (NOW() - (%s || ' minutes')::interval)
-            ORDER BY event_ts DESC
+            FROM public.vitals_snapshot
+            WHERE snapshot_ts >= (
+                (SELECT max(snapshot_ts) FROM public.vitals_snapshot)
+                - (%s || ' minutes')::interval
+            )
+            ORDER BY snapshot_ts DESC
             LIMIT %s;
         """, (minutes_back, limit))
 
@@ -231,7 +238,7 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
         inserted = 0
         for r in rows:
             row = {
-                "event_ts": r[0],
+                "event_ts": r[0],  # <-- agora event_ts = snapshot_ts
                 "cod_atendimento": r[1],
                 "id_ricadpac": r[2],
                 "temp": r[3],
@@ -245,30 +252,9 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
                 "nivel_consciencia": r[11],
             }
 
-            # =========================
-            # ETAPA 4.3: BUSCA HISTÓRICO 6H DO MESMO ATENDIMENTO
-            # =========================
-            cur.execute("""
-                SELECT temp, pas, fc, fr, spo2
-                FROM public.vitals_raw
-                WHERE cod_atendimento = %s
-                  AND event_ts >= (%s - interval '6 hours')
-                ORDER BY event_ts ASC
-            """, (row["cod_atendimento"], row["event_ts"]))
-
-            history_rows = cur.fetchall()
-            history = []
-            for h in history_rows:
-                history.append({
-                    "temp": h[0],
-                    "pas": h[1],
-                    "fc": h[2],
-                    "fr": h[3],
-                    "spo2": h[4]
-                })
-
-            # agora calcula risco com tendência
-            level, score, reason = calc_risk(row, history)
+            # Para snapshot, a parte de "tendência" ainda pode usar history se você quiser evoluir depois.
+            # Por enquanto, calc_risk(row, history) vai funcionar bem com o estado atual.
+            level, score, reason = calc_risk(row, history=[])
 
             cur.execute("""
                 INSERT INTO public.risk_events
@@ -281,6 +267,16 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
                    %s, %s, %s)
                 ON CONFLICT (cod_atendimento, event_ts)
                 DO UPDATE SET
+                  id_ricadpac = EXCLUDED.id_ricadpac,
+                  temp = EXCLUDED.temp,
+                  pas = EXCLUDED.pas,
+                  pad = EXCLUDED.pad,
+                  fc = EXCLUDED.fc,
+                  fr = EXCLUDED.fr,
+                  spo2 = EXCLUDED.spo2,
+                  dor = EXCLUDED.dor,
+                  uso_o2 = EXCLUDED.uso_o2,
+                  nivel_consciencia = EXCLUDED.nivel_consciencia,
                   risk_level = EXCLUDED.risk_level,
                   risk_score = EXCLUDED.risk_score,
                   risk_reason = EXCLUDED.risk_reason,
@@ -506,6 +502,7 @@ def snapshot_run(p: SnapshotRunIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
