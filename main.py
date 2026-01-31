@@ -1109,3 +1109,76 @@ def run_recommendations(minutes_back: int = 180, limit: int = 1000):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        from fastapi import Query
+
+@app.get("/v1/assist/recommendations")
+def list_recommendations(
+    minutes_back: int = Query(default=720, ge=1, le=10080),
+    level: str | None = Query(default=None, description="IMEDIATO | PRIORIDADE | ATENCAO"),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """
+    Lista recomendações recentes para consumo no Power Automate/painel.
+    Filtros:
+      - minutes_back: janela de tempo
+      - level: opcional (IMEDIATO, PRIORIDADE, ATENCAO)
+      - limit: paginação simples
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        if level:
+            cur.execute("""
+                SELECT
+                    cod_atendimento,
+                    snapshot_ts,
+                    state,
+                    trend_state,
+                    recommendation_level,
+                    recommendation,
+                    created_at
+                FROM public.clinical_recommendations
+                WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+                  AND UPPER(recommendation_level) = UPPER(%s)
+                ORDER BY snapshot_ts DESC
+                LIMIT %s;
+            """, (minutes_back, level, limit))
+        else:
+            cur.execute("""
+                SELECT
+                    cod_atendimento,
+                    snapshot_ts,
+                    state,
+                    trend_state,
+                    recommendation_level,
+                    recommendation,
+                    created_at
+                FROM public.clinical_recommendations
+                WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+                ORDER BY snapshot_ts DESC
+                LIMIT %s;
+            """, (minutes_back, limit))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        items = []
+        for r in rows:
+            items.append({
+                "cod_atendimento": r[0],
+                "snapshot_ts": r[1].isoformat() if r[1] else None,
+                "state": r[2],
+                "trend_state": r[3],
+                "recommendation_level": r[4],
+                "recommendation": r[5],
+                "created_at": r[6].isoformat() if r[6] else None,
+            })
+
+        return {"ok": True, "count": len(items), "items": items}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
