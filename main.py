@@ -2,7 +2,6 @@ import os
 import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from datetime import datetime, timedelta
 from typing import Optional, Literal
 
 app = FastAPI(title="PREVITA API", version="1.0.0")
@@ -40,9 +39,9 @@ class AlertsIn(BaseModel):
     min_level: str = "MODERADO"  # MODERADO ou ALTO
 
 
-# PATCH para atualizar status do alerta
-class AlertUpdateIn(BaseModel):
+class AlertStatusIn(BaseModel):
     status: Literal["NOVO", "EM_ATENDIMENTO", "RESOLVIDO"]
+    note: Optional[str] = None  # opcional (observação futura)
 
 
 # =========================
@@ -52,6 +51,15 @@ def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada.")
     return psycopg.connect(DATABASE_URL)
+
+
+def get_last_snapshot_ts(cur):
+    """
+    Retorna o MAX(snapshot_ts) de vitals_snapshot.
+    Usamos isso como "agora clínico" para evitar bugs de timezone (NOW() em UTC).
+    """
+    cur.execute("SELECT MAX(snapshot_ts) FROM public.vitals_snapshot;")
+    return cur.fetchone()[0]
 
 
 # =========================
@@ -138,7 +146,6 @@ def calc_risk(row: dict, history: list[dict]):
             return 0
         return values[-1] - values[0]
 
-    # ===== Estado atual =====
     temp = row.get("temp")
     pas  = row.get("pas")
     fc   = row.get("fc")
@@ -147,7 +154,6 @@ def calc_risk(row: dict, history: list[dict]):
     nivel = (row.get("nivel_consciencia") or "").lower()
     uso_o2 = (row.get("uso_o2") or "").lower()
 
-    # Regras pontuais
     if spo2 is not None and spo2 < 92:
         score += 40
         reasons.append(f"SpO2 baixa ({spo2})")
@@ -172,7 +178,6 @@ def calc_risk(row: dict, history: list[dict]):
         score += 30
         reasons.append(f"Consciência alterada ({nivel})")
 
-    # ===== Tendências (requer histórico preenchido) =====
     if delta("spo2") <= -3:
         score += 25
         reasons.append("Queda progressiva de SpO2")
@@ -193,12 +198,10 @@ def calc_risk(row: dict, history: list[dict]):
         score += 10
         reasons.append("Elevação progressiva de temperatura")
 
-    # Uso de O2 + tendência respiratória
     if uso_o2 in ["aa", "sim"] and delta("spo2") < 0:
         score += 10
         reasons.append("Uso de O2 + queda de SpO2")
 
-    # Classificação final
     if score >= 70:
         level = "ALTO"
     elif score >= 35:
@@ -214,11 +217,6 @@ def calc_risk(row: dict, history: list[dict]):
 
 @app.post("/v1/risk/run")
 def run_risk(minutes_back: int = 60, limit: int = 500):
-    """
-    Calcula risco e faz UPSERT em risk_events.
-    Observação: tendências só funcionam bem quando o 'history' é construído por paciente
-    (vamos melhorar isso em uma etapa posterior).
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -251,8 +249,6 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
                 "nivel_consciencia": r[11],
             }
 
-            # Hoje está passando history vazio (tendências ficam neutras).
-            # Vamos corrigir isso numa próxima etapa (histórico por paciente).
             history: list[dict] = []
             level, score, reason = calc_risk(row, history)
 
@@ -290,16 +286,10 @@ def run_risk(minutes_back: int = 60, limit: int = 500):
 
 
 # =========================
-# ALERTAS
+# ALERTAS (risk_events -> alerts)
 # =========================
 @app.post("/v1/alerts/check")
 def alerts_check(p: AlertsIn):
-    """
-    Varre risk_events recentes e grava alertas em public.alerts
-    (sem duplicar via UNIQUE(cod_atendimento, risk_level, event_ts)).
-
-    Agora também grava status='NOVO' no insert.
-    """
     level_rank = {"BAIXO": 1, "MODERADO": 2, "ALTO": 3}
     min_rank = level_rank.get(p.min_level.upper(), 2)
 
@@ -345,103 +335,6 @@ def list_alerts(
     status: str = Query(default="NOVO", description="NOVO | EM_ATENDIMENTO | RESOLVIDO"),
     limit: int = Query(default=50, ge=1, le=500),
 ):
-    """
-    Lista alertas por status (padrão: NOVO).
-    Ideal para Power Automate buscar o que precisa notificar.
-    """
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT id, event_ts, cod_atendimento, risk_level, risk_score, risk_reason, status, created_at
-            FROM public.alerts
-            WHERE status = %s
-            ORDER BY created_at DESC
-            LIMIT %s
-        """, (status.upper(), limit))
-
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        data = []
-        for r in rows:
-            data.append({
-                "id": r[0],
-                "event_ts": r[1].isoformat() if r[1] else None,
-                "cod_atendimento": r[2],
-                "risk_level": r[3],
-                "risk_score": r[4],
-                "risk_reason": r[5],
-                "status": r[6],
-                "created_at": r[7].isoformat() if r[7] else None,
-            })
-
-        return {"ok": True, "count": len(data), "items": data}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.patch("/v1/alerts/{alert_id}")
-def update_alert(alert_id: int, payload: AlertUpdateIn):
-    """
-    Atualiza status do alerta.
-    - EM_ATENDIMENTO ou RESOLVIDO
-    - Preenche handled_at quando RESOLVIDO
-    """
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        new_status = payload.status.upper()
-
-        if new_status == "RESOLVIDO":
-            cur.execute("""
-                UPDATE public.alerts
-                SET status = %s,
-                    handled_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (new_status, alert_id))
-        else:
-            cur.execute("""
-                UPDATE public.alerts
-                SET status = %s
-                WHERE id = %s
-            """, (new_status, alert_id))
-
-        conn.commit()
-
-        if cur.rowcount == 0:
-            cur.close()
-            conn.close()
-            raise HTTPException(status_code=404, detail="alert_id não encontrado")
-
-        cur.close()
-        conn.close()
-
-        return {"ok": True, "id": alert_id, "status": new_status}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-from typing import Optional
-from pydantic import BaseModel
-
-class AlertStatusIn(BaseModel):
-    status: str  # "EM_ATENDIMENTO" ou "RESOLVIDO"
-    note: Optional[str] = None  # opcional (observação)
-
-@app.get("/v1/alerts")
-def list_alerts(status: str = "NOVO", limit: int = 50):
-    """
-    Lista alertas por status. Ex:
-      /v1/alerts?status=NOVO&limit=50
-      /v1/alerts?status=EM_ATENDIMENTO
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
@@ -480,27 +373,31 @@ def list_alerts(status: str = "NOVO", limit: int = 50):
 
 @app.patch("/v1/alerts/{alert_id}")
 def update_alert_status(alert_id: int, payload: AlertStatusIn):
-    """
-    Atualiza status de um alerta.
-    status permitido: EM_ATENDIMENTO, RESOLVIDO
-    """
     st = (payload.status or "").upper().strip()
-    if st not in ("EM_ATENDIMENTO", "RESOLVIDO"):
-        raise HTTPException(status_code=400, detail="status inválido. Use EM_ATENDIMENTO ou RESOLVIDO.")
+    if st not in ("NOVO", "EM_ATENDIMENTO", "RESOLVIDO"):
+        raise HTTPException(status_code=400, detail="status inválido.")
 
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # opcional: se quiser salvar note no futuro, criamos coluna depois.
-        # por enquanto só status + updated_at
-        cur.execute("""
-            UPDATE public.alerts
-            SET status = %s,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-            RETURNING id, cod_atendimento, status, updated_at;
-        """, (st, alert_id))
+        if st == "RESOLVIDO":
+            cur.execute("""
+                UPDATE public.alerts
+                SET status = %s,
+                    handled_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, cod_atendimento, status, updated_at;
+            """, (st, alert_id))
+        else:
+            cur.execute("""
+                UPDATE public.alerts
+                SET status = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, cod_atendimento, status, updated_at;
+            """, (st, alert_id))
 
         row = cur.fetchone()
         conn.commit()
@@ -523,29 +420,25 @@ def update_alert_status(alert_id: int, payload: AlertStatusIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# =========================
+# STATE (já estava correto: ancorado no MAX(snapshot_ts))
+# =========================
 class StateRunIn(BaseModel):
-    minutes_back: int = 240   # janela para considerar snapshots recentes
-    history_minutes: int = 360  # histórico para tendência/persistência (6h)
+    minutes_back: int = 240
+    history_minutes: int = 360
     limit: int = 500
+
 
 def _safe_num(x):
     return None if x is None else float(x)
 
+
 def calc_state(snapshot: dict, history: list[dict]):
-    """
-    Retorna: (state, state_score, reason)
-    Estados:
-      - ESTAVEL
-      - EM_OBSERVACAO
-      - COMPENSANDO
-      - EM_RISCO
-      - INSTABILIZANDO
-      - CRITICO
-    """
+    # (mantive exatamente como você mandou)
     reasons = []
     score = 0
 
-    # ===== dados atuais (snapshot) =====
     temp = _safe_num(snapshot.get("temp"))
     pas  = _safe_num(snapshot.get("pas"))
     pad  = _safe_num(snapshot.get("pad"))
@@ -555,7 +448,6 @@ def calc_state(snapshot: dict, history: list[dict]):
     uso_o2 = (snapshot.get("uso_o2") or "").strip().lower()
     nivel = (snapshot.get("nivel_consciencia") or "").strip().lower()
 
-    # ===== helpers de tendência/persistência =====
     def series(field):
         vals = [h.get(field) for h in history if h.get(field) is not None]
         return vals
@@ -566,19 +458,6 @@ def calc_state(snapshot: dict, history: list[dict]):
             return 0
         return vals[-1] - vals[0]
 
-    def last(field):
-        vals = series(field)
-        return vals[-1] if vals else None
-
-    def minv(field):
-        vals = series(field)
-        return min(vals) if vals else None
-
-    def maxv(field):
-        vals = series(field)
-        return max(vals) if vals else None
-
-    # Persistência simples: quantas leituras anormais em sequência (últimas 3)
     def persist_low_spo2(th=94):
         vals = series("spo2")
         tail = vals[-3:] if len(vals) >= 3 else vals
@@ -594,8 +473,6 @@ def calc_state(snapshot: dict, history: list[dict]):
         tail = vals[-3:] if len(vals) >= 3 else vals
         return sum(1 for v in tail if v > th)
 
-    # ===== Regras de estado (pensamento clínico) =====
-    # 1) CRÍTICO (ameaça imediata)
     critical_hits = 0
     if spo2 is not None and spo2 < 90:
         critical_hits += 1
@@ -617,12 +494,9 @@ def calc_state(snapshot: dict, history: list[dict]):
         reasons.append(f"Consciência crítica ({nivel})")
 
     if critical_hits >= 2:
-        # estado crítico com múltiplos sistemas envolvidos
         score = 90 + min(10, critical_hits * 2)
         return "CRITICO", min(score, 100), " | ".join(reasons)
 
-    # 2) INSTABILIZANDO (já fora do normal + tendência/persistência)
-    # foco: sinais compensatórios e piora progressiva
     if delta("spo2") <= -3 and (spo2 is not None and spo2 < 94):
         score += 25
         reasons.append("Queda progressiva de SpO2 + valor baixo")
@@ -646,16 +520,13 @@ def calc_state(snapshot: dict, history: list[dict]):
         score += 10
         reasons.append("FC alta persistente (últimas medições)")
 
-    # uso de O2 + piora sugere risco de deterioração respiratória
     if uso_o2 in ["sim", "cateter", "mascara", "venturi", "o2"] and delta("spo2") < 0:
         score += 10
         reasons.append("Uso de O2 com piora de SpO2")
 
-    # Se score já subiu bastante, classifica como INSTABILIZANDO
     if score >= 45:
         return "INSTABILIZANDO", min(score + 35, 100), " | ".join(reasons)
 
-    # 3) EM_RISCO (alteração relevante sem franca instabilidade)
     if spo2 is not None and spo2 < 94:
         score += 20
         reasons.append(f"SpO2 baixa ({spo2})")
@@ -675,7 +546,6 @@ def calc_state(snapshot: dict, history: list[dict]):
     if score >= 30:
         return "EM_RISCO", min(score + 15, 100), " | ".join(reasons)
 
-    # 4) COMPENSANDO (valores quase normais, mas tendência/persistência sugere compensação)
     comp = 0
     if delta("fc") >= 10:
         comp += 1
@@ -693,36 +563,31 @@ def calc_state(snapshot: dict, history: list[dict]):
     if comp >= 2:
         return "COMPENSANDO", 35, " | ".join(reasons)
 
-    # 5) EM_OBSERVACAO (pequenas alterações, sem tendência forte)
     if (spo2 is not None and 94 <= spo2 < 96) or (fc is not None and 95 <= fc <= 110) or (fr is not None and 19 <= fr <= 22):
         reasons.append("Pequenas alterações: manter observação e reavaliar")
         return "EM_OBSERVACAO", 20, " | ".join(reasons)
 
-    # 6) ESTÁVEL
     return "ESTAVEL", 10, "Sinais dentro do esperado sem tendência de piora"
+
 
 @app.post("/v1/state/run")
 def state_run(p: StateRunIn):
-    """
-    Calcula clinical_state com base em vitals_snapshot (estado atual)
-    + histórico recente em vitals_raw (tendência/persistência).
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # snapshots recentes (ancorado no max(snapshot_ts) para evitar problema de timezone)
+        last_snapshot = get_last_snapshot_ts(cur)
+        if not last_snapshot:
+            return {"ok": True, "processed": 0, "upserted": 0, "reason": "Sem snapshots em vitals_snapshot"}
+
         cur.execute("""
             SELECT cod_atendimento, snapshot_ts, id_ricadpac,
                    temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia, profissional
             FROM public.vitals_snapshot
-            WHERE snapshot_ts >= (
-                (SELECT max(snapshot_ts) FROM public.vitals_snapshot)
-                - (%s || ' minutes')::interval
-            )
+            WHERE snapshot_ts >= (%s - (%s || ' minutes')::interval)
             ORDER BY snapshot_ts DESC
             LIMIT %s;
-        """, (p.minutes_back, p.limit))
+        """, (last_snapshot, p.minutes_back, p.limit))
         snaps = cur.fetchall()
 
         upserted = 0
@@ -744,7 +609,6 @@ def state_run(p: StateRunIn):
                 "profissional": s[12],
             }
 
-            # histórico do mesmo atendimento (ancorado no snapshot_ts)
             cur.execute("""
                 SELECT event_ts, temp, pas, fc, fr, spo2
                 FROM public.vitals_raw
@@ -768,7 +632,6 @@ def state_run(p: StateRunIn):
 
             state, state_score, state_reason = calc_state(snapshot, history)
 
-            # upsert por atendimento + snapshot_ts
             cur.execute("""
                 INSERT INTO public.clinical_state
                   (cod_atendimento, id_ricadpac, snapshot_ts,
@@ -803,13 +666,12 @@ def state_run(p: StateRunIn):
 
 
 # =========================
-# E2 — Clinical Trends Engine
+# TRENDS (corrigido: ancorado no MAX(snapshot_ts))
 # =========================
-
 class TrendsRunIn(BaseModel):
-    minutes_back: int = 1440        # quantos minutos pra trás pegar snapshots (24h)
-    history_minutes: int = 360      # janela de histórico para tendência (6h)
-    limit: int = 500                # limite de pacientes/snapshots processados
+    minutes_back: int = 1440
+    history_minutes: int = 360
+    limit: int = 500
 
 
 def _safe_float(x):
@@ -822,10 +684,6 @@ def _safe_float(x):
 
 
 def calc_trends(snapshot: dict, history: list[dict]):
-    """
-    Retorna (trend_state, trend_score, trend_reason)
-    trend_state: ESTAVEL | ATENCAO | PIORA
-    """
     score = 0
     reasons = []
 
@@ -842,16 +700,14 @@ def calc_trends(snapshot: dict, history: list[dict]):
         vals = series(field)
         if len(vals) < 2:
             return 0.0
-        return vals[-1] - vals[0]  # variação na janela
+        return vals[-1] - vals[0]
 
-    # ----- deltas (tendências) -----
     d_spo2 = slope("spo2")
     d_fc   = slope("fc")
     d_fr   = slope("fr")
     d_pas  = slope("pas")
     d_temp = slope("temp")
 
-    # ----- valores atuais (do snapshot) -----
     spo2 = _safe_float(snapshot.get("spo2"))
     fc   = _safe_float(snapshot.get("fc"))
     fr   = _safe_float(snapshot.get("fr"))
@@ -861,8 +717,6 @@ def calc_trends(snapshot: dict, history: list[dict]):
     uso_o2 = (snapshot.get("uso_o2") or "").lower()
     nivel  = (snapshot.get("nivel_consciencia") or "").lower()
 
-    # ===== Regras de tendência (disruptivo: antecipação) =====
-    # 1) Respiratório piorando (mesmo antes de ficar crítico)
     if d_spo2 <= -3:
         score += 25
         reasons.append("SpO2 em queda (tendência)")
@@ -871,38 +725,30 @@ def calc_trends(snapshot: dict, history: list[dict]):
         score += 15
         reasons.append("FR em subida (tendência)")
 
-    # “combo”: SpO2 caindo + FR subindo = forte sinal precoce
     if d_spo2 <= -2 and d_fr >= 3:
         score += 20
         reasons.append("Piora respiratória combinada (SpO2↓ + FR↑)")
 
-    # O2 em uso e ainda assim SpO2 piora
     if uso_o2 in ["aa", "sim", "s", "uso"] and d_spo2 < 0:
         score += 10
         reasons.append("Uso de O2 + SpO2 piorando")
 
-    # 2) Hemodinâmica piorando
     if d_pas <= -20:
         score += 20
         reasons.append("PAS em queda progressiva")
 
-    # 3) Estresse sistêmico / infeccioso
     if d_temp >= 1.0:
         score += 10
         reasons.append("Temperatura em elevação progressiva")
 
-    # 4) Taquicardia progressiva
     if d_fc >= 15:
         score += 15
         reasons.append("FC em aumento progressivo")
 
-    # 5) Estado neurológico (alerta precoce)
     if nivel in ["sonolenta", "confuso", "rebaixado"]:
         score += 15
         reasons.append("Consciência alterada (sinal precoce)")
 
-    # ===== Ajustes por “perigo silencioso” mesmo sem tendência =====
-    # (ex.: valores fora do normal mas ainda não críticos)
     if spo2 is not None and 92 <= spo2 <= 94:
         score += 10
         reasons.append(f"SpO2 limítrofe ({spo2})")
@@ -915,7 +761,6 @@ def calc_trends(snapshot: dict, history: list[dict]):
         score += 5
         reasons.append(f"FC limítrofe ({fc})")
 
-    # ===== Classificação =====
     if score >= 45:
         state = "PIORA"
     elif score >= 20:
@@ -931,30 +776,26 @@ def calc_trends(snapshot: dict, history: list[dict]):
 
 @app.post("/v1/trends/run")
 def run_trends(p: TrendsRunIn):
-    """
-    Gera tendências por snapshot:
-    - pega vitals_snapshot recentes
-    - busca histórico (vitals_raw) por paciente
-    - grava em clinical_trends
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        # 1) snapshots recentes
+        last_snapshot = get_last_snapshot_ts(cur)
+        if not last_snapshot:
+            return {"ok": True, "processed": 0, "upserted": 0, "reason": "Sem snapshots em vitals_snapshot"}
+
         cur.execute("""
             SELECT cod_atendimento, snapshot_ts, id_ricadpac,
                    temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia
             FROM public.vitals_snapshot
-            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+            WHERE snapshot_ts >= (%s - (%s || ' minutes')::interval)
             ORDER BY snapshot_ts DESC
             LIMIT %s;
-        """, (p.minutes_back, p.limit))
+        """, (last_snapshot, p.minutes_back, p.limit))
         snaps = cur.fetchall()
 
         upserted = 0
 
-        # 2) para cada snapshot, carrega histórico do mesmo paciente em vitals_raw
         for s in snaps:
             cod_atendimento = s[0]
             snapshot_ts     = s[1]
@@ -1025,14 +866,14 @@ def run_trends(p: TrendsRunIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# =========================
-# E2.3 — Early Alerts (Trend-based)
-# =========================
 
+# =========================
+# EARLY ALERTS
+# =========================
 class EarlyAlertsIn(BaseModel):
     minutes_back: int = 1440
-    min_trend_state: str = "ATENCAO"   # ATENCAO ou PIORA
-    exclude_state: str | None = None  # opcional: "CRITICO" para não duplicar com alertas críticos
+    min_trend_state: str = "ATENCAO"
+    exclude_state: str | None = None
 
 
 @app.post("/v1/early-alerts/check")
@@ -1044,13 +885,17 @@ def early_alerts_check(p: EarlyAlertsIn):
         conn = get_conn()
         cur = conn.cursor()
 
-        # Pega tendências recentes
+        # Aqui também vale o mesmo cuidado. Ancoramos no last_snapshot.
+        last_snapshot = get_last_snapshot_ts(cur)
+        if not last_snapshot:
+            return {"ok": True, "scanned": 0, "inserted": 0, "reason": "Sem snapshots"}
+
         cur.execute("""
             SELECT t.snapshot_ts, t.cod_atendimento, t.trend_state, t.trend_score, t.trend_reason
             FROM public.clinical_trends t
-            WHERE t.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+            WHERE t.snapshot_ts >= (%s - (%s || ' minutes')::interval)
             ORDER BY t.snapshot_ts DESC;
-        """, (p.minutes_back,))
+        """, (last_snapshot, p.minutes_back))
         trends = cur.fetchall()
 
         inserted = 0
@@ -1063,7 +908,6 @@ def early_alerts_check(p: EarlyAlertsIn):
             if rank.get(ts, 0) < min_rank:
                 continue
 
-            # (Opcional) não gerar alerta de tendência se já estiver CRITICO no clinical_state
             if p.exclude_state:
                 cur.execute("""
                     SELECT state
@@ -1075,7 +919,7 @@ def early_alerts_check(p: EarlyAlertsIn):
                 if r and (r[0] or "").upper() == p.exclude_state.upper():
                     continue
 
-            alert_level = ts  # ATENCAO ou PIORA
+            alert_level = ts
 
             cur.execute("""
                 INSERT INTO public.early_alerts
@@ -1099,31 +943,37 @@ def early_alerts_check(p: EarlyAlertsIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-from pydantic import BaseModel
-
+# =========================
+# ASSIST ALERTS (corrigido: ancorado no MAX(snapshot_ts))
+# =========================
 class AssistAlertsIn(BaseModel):
-    minutes_back: int = 360          # olha tendências das últimas 6h
-    min_score: int = 60              # só dispara se trend_score >= 60
-    include_states: list[str] = ["PIORA", "CRITICO"]  # quais tendências viram alerta
+    minutes_back: int = 360
+    min_score: int = 60
+    include_states: list[str] = ["PIORA", "CRITICO"]
+
 
 @app.post("/v1/assist/alerts/run")
 def assist_alerts_run(p: AssistAlertsIn):
-    """
-    Promove tendências (clinical_trends) para alertas assistenciais (assistential_alerts),
-    sem duplicar alerta ativo por paciente (graças ao índice uq_assist_alert_active).
-    """
     try:
         conn = get_conn()
         cur = conn.cursor()
 
+        last_snapshot = get_last_snapshot_ts(cur)
+        if not last_snapshot:
+            return {"ok": True, "scanned": 0, "inserted": 0, "skipped_active": 0, "reason": "Sem snapshots"}
+
+        include_states = [(s or "").upper() for s in (p.include_states or [])]
+        if not include_states:
+            include_states = ["PIORA", "CRITICO"]
+
         cur.execute("""
             SELECT cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason
             FROM public.clinical_trends
-            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
-              AND trend_state = ANY(%s)
+            WHERE snapshot_ts >= (%s - (%s || ' minutes')::interval)
+              AND UPPER(trend_state) = ANY(%s)
               AND trend_score >= %s
             ORDER BY snapshot_ts DESC;
-        """, (p.minutes_back, p.include_states, p.min_score))
+        """, (last_snapshot, p.minutes_back, include_states, p.min_score))
 
         rows = cur.fetchall()
 
@@ -1131,13 +981,11 @@ def assist_alerts_run(p: AssistAlertsIn):
         skipped = 0
 
         for (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason) in rows:
-            # Mapeia tendência -> nível de alerta
             if (trend_state or "").upper() == "CRITICO":
                 alert_level = "CRITICO"
             else:
                 alert_level = "ATENCAO"
 
-            # Tenta criar alerta ativo; se já existir (unique index), ignora
             cur.execute("""
                 INSERT INTO public.assistential_alerts
                   (cod_atendimento, snapshot_ts, alert_level, alert_score, alert_reason, status)
@@ -1161,34 +1009,41 @@ def assist_alerts_run(p: AssistAlertsIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =========================
+# RECOMMENDATIONS (✅ CORRIGIDO: ancorado no MAX(snapshot_ts))
+# =========================
 @app.post("/v1/assist/recommendations/run")
-def run_recommendations(minutes_back: int = 180):
+def run_recommendations(minutes_back: int = 180, limit: int = 1000):
     try:
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute("""
-    SELECT
-        s.cod_atendimento,
-        s.snapshot_ts,
-        s.state,
-        t.trend_state,
-        v.spo2,
-        v.fr,
-        v.fc,
-        v.pas,
-        v.uso_o2
-    FROM public.clinical_state s
-    LEFT JOIN public.clinical_trends t
-      ON t.cod_atendimento = s.cod_atendimento
-     AND t.snapshot_ts = s.snapshot_ts
-    LEFT JOIN public.vitals_snapshot v
-      ON v.cod_atendimento = s.cod_atendimento
-     AND v.snapshot_ts = s.snapshot_ts
-    WHERE s.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
-    ORDER BY s.snapshot_ts DESC;
-""", (minutes_back,))
+        last_snapshot = get_last_snapshot_ts(cur)
+        if not last_snapshot:
+            return {"ok": True, "processed": 0, "upserted": 0, "reason": "Sem snapshots em vitals_snapshot"}
 
+        cur.execute("""
+            SELECT
+                s.cod_atendimento,
+                s.snapshot_ts,
+                s.state,
+                t.trend_state,
+                v.spo2,
+                v.fr,
+                v.fc,
+                v.pas,
+                v.uso_o2
+            FROM public.clinical_state s
+            LEFT JOIN public.clinical_trends t
+              ON t.cod_atendimento = s.cod_atendimento
+             AND t.snapshot_ts = s.snapshot_ts
+            LEFT JOIN public.vitals_snapshot v
+              ON v.cod_atendimento = s.cod_atendimento
+             AND v.snapshot_ts = s.snapshot_ts
+            WHERE s.snapshot_ts >= (%s - (%s || ' minutes')::interval)
+            ORDER BY s.snapshot_ts DESC
+            LIMIT %s;
+        """, (last_snapshot, minutes_back, limit))
 
         rows = cur.fetchall()
         inserted = 0
@@ -1202,9 +1057,10 @@ def run_recommendations(minutes_back: int = 180):
             level = "ATENCAO"
             recommendation = "Manter rotina assistencial e reavaliar conforme protocolo."
 
+            # IMEDIATO
             if (
-                state == "CRITICO"
-                or (trend_state == "PIORA" and spo2 is not None and spo2 < 90)
+                (state or "").upper() == "CRITICO"
+                or ((trend_state or "").upper() == "PIORA" and spo2 is not None and spo2 < 90)
                 or (fr is not None and fr >= 30)
                 or (fc is not None and fc >= 180)
                 or (pas is not None and pas <= 85)
@@ -1215,10 +1071,11 @@ def run_recommendations(minutes_back: int = 180):
                     "Avaliar suporte ventilatório e hemodinâmico."
                 )
 
+            # PRIORIDADE
             elif (
-                state == "EM_OBSERVACAO"
-                or trend_state == "PIORA"
-                or (uso_o2 and spo2 is not None and spo2 < 94)
+                (state or "").upper() == "EM_OBSERVACAO"
+                or (trend_state or "").upper() == "PIORA"
+                or ((uso_o2 or "").strip() != "" and spo2 is not None and spo2 < 94)
             ):
                 level = "PRIORIDADE"
                 recommendation = (
@@ -1252,7 +1109,3 @@ def run_recommendations(minutes_back: int = 180):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
