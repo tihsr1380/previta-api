@@ -1,14 +1,13 @@
-name: PREVITA - Alertas Telegram (2 em 2 minutos)
+name: PREVITA - Alertas Telegram
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub só garante no mínimo 5 minutos
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
   send-alerts:
     runs-on: ubuntu-latest
-
     steps:
       - name: Wake up Render (health)
         run: |
@@ -18,33 +17,16 @@ jobs:
             "https://previta-api.onrender.com/health"
           echo ""
 
-      - name: Chamar API PREVITA (Telegram) - 3x (0min, +2min, +4min)
+      - name: Chamar API PREVITA (Telegram) - 1x
         env:
           ALERT_API_KEY: ${{ secrets.ALERT_API_KEY }}
         run: |
           set -e
           URL="https://previta-api.onrender.com/v1/notify/telegram/run?minutes_back=1440&max_send=10"
-
-          for i in 1 2 3; do
-            echo "=============================="
-            echo "DISPARO $i - $(date -u) UTC"
-            echo "POST: $URL"
-            echo "=============================="
-
-            # Se você usa chave, mantém o header.
-            # Se você NÃO usa chave, pode remover a linha do -H "X-API-KEY..."
-            RESP=$(curl -sS -L --max-time 90 --retry 5 --retry-all-errors \
-              -X POST "$URL" \
-              -H "X-API-KEY: $ALERT_API_KEY" \
-              -H "Content-Type: application/json")
-
-            echo "Resposta API:"
-            echo "$RESP"
-            echo ""
-
-            # espera 2 minutos entre chamadas (simula 2/2)
-            if [ "$i" != "3" ]; then
-              echo "Aguardando 120s..."
-              sleep 120
-            fi
-          done
+          echo "POST: $URL"
+          RESP=$(curl -sS -L --max-time 90 --retry 5 --retry-all-errors \
+            -X POST "$URL" \
+            -H "X-API-KEY: $ALERT_API_KEY" \
+            -H "Content-Type: application/json")
+          echo "Resposta API:"
+          echo "$RESP"
