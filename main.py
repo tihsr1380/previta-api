@@ -8,8 +8,8 @@ from typing import Optional, Literal
 app = FastAPI(title="PREVITA API", version="1.0.0")
 import requests
 
-TELEGRAM_BOT_TOKEN = os.environ.get("bot7948662182:AAGkGAfdQfehFAKuFI-YNnwaeRMxmmo9s2I")
-TELEGRAM_CHAT_ID = os.environ.get("7948662182")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1697,6 +1697,7 @@ def notify_run(minutes_back: int = 1440, limit: int = 50):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
