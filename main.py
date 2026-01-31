@@ -1645,6 +1645,128 @@ def dispatch_mark(p: DispatchMarkIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+import httpx
+from fastapi import Header
+
+ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+def _require_env():
+    missing = []
+    if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Missing env vars: {', '.join(missing)}")
+
+def _check_key(x_api_key: str | None):
+    # Se você não configurar ALERT_API_KEY, não bloqueia (útil em validação)
+    if ALERT_API_KEY and x_api_key != ALERT_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+async def _tg_send(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Telegram error: {r.status_code} {r.text}")
+        return r.json()
+
+@app.post("/v1/notify/telegram/run")
+async def notify_telegram_run(
+    minutes_back: int = 180,
+    max_send: int = 10,
+    x_api_key: str | None = Header(default=None, alias="X-API-KEY"),
+):
+    """
+    Envia para Telegram os eventos mais recentes e relevantes (IMEDIATO/PRIORIDADE),
+    evitando spam com tabela de controle.
+    """
+    _check_key(x_api_key)
+    _require_env()
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # Tabela de anti-duplicação (cria se não existir)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.alert_notifications (
+          id bigserial PRIMARY KEY,
+          cod_atendimento int NOT NULL,
+          snapshot_ts timestamptz NOT NULL,
+          channel text NOT NULL DEFAULT 'TELEGRAM',
+          sent_at timestamptz NOT NULL DEFAULT now(),
+          status text NOT NULL DEFAULT 'SENT',
+          response text NULL
+        );
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_alert_notifications
+        ON public.alert_notifications (cod_atendimento, snapshot_ts, channel);
+        """)
+
+        # Puxa recomendações recentes (ajuste aqui se sua tabela tiver outros campos)
+        cur.execute("""
+            SELECT cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions
+            FROM public.clinical_recommendations
+            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+              AND recommendation_level IN ('IMEDIATO','PRIORIDADE')
+            ORDER BY snapshot_ts DESC
+            LIMIT %s;
+        """, (minutes_back, max_send))
+
+        rows = cur.fetchall()
+
+        sent = 0
+        skipped = 0
+
+        for (cod_atendimento, snapshot_ts, level, syndrome, confidence, actions) in rows:
+
+            # Se já enviou antes, não envia de novo
+            cur.execute("""
+                INSERT INTO public.alert_notifications (cod_atendimento, snapshot_ts, channel)
+                VALUES (%s, %s, 'TELEGRAM')
+                ON CONFLICT (cod_atendimento, snapshot_ts, channel) DO NOTHING;
+            """, (cod_atendimento, snapshot_ts))
+
+            if cur.rowcount == 0:
+                skipped += 1
+                continue
+
+            msg = (
+                f"🚨 PREVITA ALERTA ({level})\n"
+                f"Atendimento: {cod_atendimento}\n"
+                f"Hora: {snapshot_ts}\n"
+                f"Síndrome: {syndrome}\n"
+                f"Confiança: {confidence}\n\n"
+                f"Ações:\n{(actions or '')[:1200]}"
+            )
+
+            tg_resp = await _tg_send(msg)
+
+            # salva resposta do telegram
+            cur.execute("""
+                UPDATE public.alert_notifications
+                SET response = %s
+                WHERE cod_atendimento=%s AND snapshot_ts=%s AND channel='TELEGRAM';
+            """, (str(tg_resp)[:2000], cod_atendimento, snapshot_ts))
+
+            sent += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "found": len(rows), "sent": sent, "skipped_already_sent": skipped}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/notify/run")
 def notify_run(minutes_back: int = 1440, limit: int = 50):
     """
@@ -1697,6 +1819,7 @@ def notify_run(minutes_back: int = 1440, limit: int = 50):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
