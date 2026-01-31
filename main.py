@@ -1820,6 +1820,114 @@ def notify_run(minutes_back: int = 1440, limit: int = 50):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+from fastapi import APIRouter, Header, HTTPException
+from typing import Optional, List, Dict, Any
+import os
+import requests
+import psycopg2
+import psycopg2.extras
+
+router = APIRouter()
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # ID DO GRUPO (ex: -100xxxxxxxxxx)
+DATABASE_URL = os.environ.get("DATABASE_URL")          # Render/Supabase Postgres URL
+API_KEY = os.environ.get("API_KEY")                    # sua chave interna (X-API-KEY)
+
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing env var: DATABASE_URL")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+def telegram_send(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    r = requests.post(url, json=payload, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+
+def format_alert(row: Dict[str, Any]) -> str:
+    # Mensagem "plantão-friendly"
+    return (
+        "🚨 <b>PREVITA – ALERTA CLÍNICO</b>\n\n"
+        f"🆔 <b>Atendimento:</b> {row.get('cod_atendimento')}\n"
+        f"⚠️ <b>Nível:</b> {row.get('recommendation_level')}\n"
+        f"📌 <b>Estado:</b> {row.get('state')} ({row.get('trend_state')})\n"
+        f"🧠 <b>Confiança:</b> {row.get('confidence')}\n"
+        f"🧩 <b>Síndrome:</b> {row.get('syndrome')}\n\n"
+        f"📣 <b>Recomendação:</b>\n{row.get('recommendation')}\n\n"
+        f"🩺 <b>Ações sugeridas:</b>\n{row.get('actions')}\n\n"
+        f"⏱️ <b>Snapshot:</b> {row.get('snapshot_ts')}\n"
+    )
+
+@router.post("/v1/notify/telegram/run")
+def notify_telegram_run(
+    max_send: int = 5,
+    x_api_key: Optional[str] = Header(None, convert_underscores=False),
+):
+    # Segurança simples
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid X-API-KEY")
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise HTTPException(status_code=500, detail="Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+
+    sent = 0
+    found = 0
+
+    # Seleção CLÍNICA (não cronológica)
+    sql_select = """
+        SELECT id, cod_atendimento, snapshot_ts, state, trend_state,
+               recommendation_level, recommendation, syndrome, actions,
+               confidence, status, notified_at
+        FROM clinical_recommendations
+        WHERE
+            recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+            AND status = 'NOVO'
+            AND (notified_at IS NULL OR trend_state = 'PIORA')
+        ORDER BY
+            CASE recommendation_level WHEN 'IMEDIATO' THEN 2 ELSE 1 END DESC,
+            confidence DESC NULLS LAST,
+            created_at ASC
+        LIMIT %s
+    """
+
+    sql_update = """
+        UPDATE clinical_recommendations
+        SET notified_at = NOW(), updated_at = NOW()
+        WHERE id = %s
+    """
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_select, (max_send,))
+                rows = cur.fetchall()
+                found = len(rows)
+
+                for row in rows:
+                    msg = format_alert(row)
+                    telegram_send(msg)
+                    cur.execute(sql_update, (row["id"],))
+                    sent += 1
+
+            conn.commit()
+
+        return {"ok": True, "found": found, "sent": sent}
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+
 
 
 
