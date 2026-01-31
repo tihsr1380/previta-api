@@ -1456,6 +1456,176 @@ def update_recommendation(rec_id: int, payload: RecUpdateIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+from typing import List, Dict, Any
+from fastapi import Body
+
+class DispatchPullIn(BaseModel):
+    minutes_back: int = 720          # janela de busca (12h)
+    limit: int = 50                  # quantos itens retornar
+    channel: str = "WHATSAPP"        # WHATSAPP | SMS | TEST
+
+def _mk_message_medico(item: dict) -> str:
+    return (
+        "⚠️ ALERTA PREVITA – {level}\n\n"
+        "Atendimento: {cod}\n"
+        "Síndrome: {syn}\n"
+        "Confiança: {conf}%\n\n"
+        "Ações (resumo):\n{actions}\n\n"
+        "Registrar evolução e reavaliar imediatamente."
+    ).format(
+        level=item["recommendation_level"],
+        cod=item["cod_atendimento"],
+        syn=item.get("syndrome") or "NA",
+        conf=item.get("confidence") or 0,
+        actions=item.get("actions") or "-"
+    )
+
+def _mk_message_enfermagem(item: dict) -> str:
+    return (
+        "⚠️ PRIORIDADE ASSISTENCIAL – PREVITA\n\n"
+        "Atendimento: {cod}\n"
+        "Nível: {level}\n"
+        "Confiança: {conf}%\n\n"
+        "Condutas:\n{actions}\n\n"
+        "Se piora, escalar para médico."
+    ).format(
+        cod=item["cod_atendimento"],
+        level=item["recommendation_level"],
+        conf=item.get("confidence") or 0,
+        actions=item.get("actions") or "-"
+    )
+
+@app.post("/v1/assist/dispatch/pull")
+def dispatch_pull(p: DispatchPullIn):
+    """
+    Retorna itens que precisam ser enviados AGORA (IMEDIATO/PRIORIDADE),
+    e cria log PENDING (evita duplicar).
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # regra de corte (pode ajustar depois)
+        cur.execute("""
+            SELECT
+              cod_atendimento,
+              snapshot_ts,
+              recommendation_level,
+              syndrome,
+              confidence,
+              actions
+            FROM public.clinical_recommendations
+            WHERE snapshot_ts >= (
+              (SELECT max(snapshot_ts) FROM public.clinical_recommendations)
+              - (%s || ' minutes')::interval
+            )
+              AND (
+                (recommendation_level = 'IMEDIATO' AND confidence >= 85)
+                OR
+                (recommendation_level = 'PRIORIDADE' AND confidence >= 70)
+              )
+            ORDER BY snapshot_ts DESC
+            LIMIT %s;
+        """, (p.minutes_back, p.limit))
+
+        rows = cur.fetchall()
+
+        items: List[Dict[str, Any]] = []
+        for (cod, snapshot_ts, level, syndrome, confidence, actions) in rows:
+            base = {
+                "cod_atendimento": cod,
+                "snapshot_ts": snapshot_ts,
+                "recommendation_level": level,
+                "syndrome": syndrome,
+                "confidence": int(confidence or 0),
+                "actions": actions or ""
+            }
+
+            # target por severidade
+            target = "MEDICO" if level == "IMEDIATO" else "ENFERMAGEM"
+
+            # tenta “reservar” no log para não duplicar
+            cur.execute("""
+                INSERT INTO public.dispatch_log
+                  (cod_atendimento, snapshot_ts, target, channel, status)
+                VALUES
+                  (%s, %s, %s, %s, 'PENDING')
+                ON CONFLICT (cod_atendimento, snapshot_ts, target)
+                DO NOTHING;
+            """, (cod, snapshot_ts, target, p.channel.upper()))
+
+            if cur.rowcount != 1:
+                # já estava reservado/mandado antes
+                continue
+
+            # monta mensagem pronta
+            if target == "MEDICO":
+                msg = _mk_message_medico(base)
+            else:
+                msg = _mk_message_enfermagem(base)
+
+            items.append({
+                **base,
+                "target": target,
+                "channel": p.channel.upper(),
+                "message": msg
+            })
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "count": len(items), "items": items}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class DispatchMarkIn(BaseModel):
+    cod_atendimento: int
+    snapshot_ts: str  # iso
+    target: Literal["MEDICO", "ENFERMAGEM"]
+    status: Literal["SENT", "FAILED", "ACK"] = "SENT"
+    error: Optional[str] = None
+
+@app.post("/v1/assist/dispatch/mark")
+def dispatch_mark(p: DispatchMarkIn):
+    """
+    Robô chama isso depois que tentou enviar (SENT/FAILED) ou quando alguém confirmou (ACK).
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            UPDATE public.dispatch_log
+            SET status = %s,
+                attempts = attempts + 1,
+                last_error = %s,
+                sent_at = CASE WHEN %s='SENT' THEN CURRENT_TIMESTAMP ELSE sent_at END
+            WHERE cod_atendimento = %s
+              AND snapshot_ts = %s::timestamp
+              AND target = %s
+            RETURNING id;
+        """, (p.status, p.error, p.status, p.cod_atendimento, p.snapshot_ts, p.target))
+
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="dispatch_log não encontrado")
+
+        return {"ok": True, "status": p.status}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 
 
