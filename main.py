@@ -1161,5 +1161,93 @@ def assist_alerts_run(p: AssistAlertsIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/assist/recommendations/run")
+def run_recommendations(minutes_back: int = 180):
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT
+                s.cod_atendimento,
+                s.snapshot_ts,
+                s.state,
+                t.trend_state,
+                s.spo2,
+                s.fr,
+                s.fc,
+                s.pas,
+                s.uso_o2
+            FROM public.clinical_state s
+            LEFT JOIN public.clinical_trends t
+              ON t.cod_atendimento = s.cod_atendimento
+             AND t.snapshot_ts = s.snapshot_ts
+            WHERE s.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+            ORDER BY s.snapshot_ts DESC;
+        """, (minutes_back,))
+
+        rows = cur.fetchall()
+        inserted = 0
+
+        for r in rows:
+            (
+                cod_atendimento, snapshot_ts, state, trend_state,
+                spo2, fr, fc, pas, uso_o2
+            ) = r
+
+            level = "ATENCAO"
+            recommendation = "Manter rotina assistencial e reavaliar conforme protocolo."
+
+            if (
+                state == "CRITICO"
+                or (trend_state == "PIORA" and spo2 is not None and spo2 < 90)
+                or (fr is not None and fr >= 30)
+                or (fc is not None and fc >= 180)
+                or (pas is not None and pas <= 85)
+            ):
+                level = "IMEDIATO"
+                recommendation = (
+                    "Acionar médico imediatamente. "
+                    "Avaliar suporte ventilatório e hemodinâmico."
+                )
+
+            elif (
+                state == "EM_OBSERVACAO"
+                or trend_state == "PIORA"
+                or (uso_o2 and spo2 is not None and spo2 < 94)
+            ):
+                level = "PRIORIDADE"
+                recommendation = (
+                    "Manter monitorização contínua. "
+                    "Reavaliar sinais vitais em até 30 minutos "
+                    "e considerar avaliação médica."
+                )
+
+            cur.execute("""
+                INSERT INTO public.clinical_recommendations
+                  (cod_atendimento, snapshot_ts, state, trend_state,
+                   recommendation_level, recommendation)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (cod_atendimento, snapshot_ts)
+                DO UPDATE SET
+                  recommendation_level = EXCLUDED.recommendation_level,
+                  recommendation = EXCLUDED.recommendation,
+                  created_at = CURRENT_TIMESTAMP;
+            """, (
+                cod_atendimento, snapshot_ts, state, trend_state,
+                level, recommendation
+            ))
+
+            inserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "processed": len(rows), "upserted": inserted}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
