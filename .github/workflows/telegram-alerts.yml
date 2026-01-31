@@ -2,7 +2,7 @@ name: PREVITA – Alertas Telegram (2 em 2 minutos)
 
 on:
   schedule:
-    - cron: "*/2 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
