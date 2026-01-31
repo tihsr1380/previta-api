@@ -523,4 +523,184 @@ def update_alert_status(alert_id: int, payload: AlertStatusIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+class StateRunIn(BaseModel):
+    minutes_back: int = 240   # janela para considerar snapshots recentes
+    history_minutes: int = 360  # histórico para tendência/persistência (6h)
+    limit: int = 500
+
+def _safe_num(x):
+    return None if x is None else float(x)
+
+def calc_state(snapshot: dict, history: list[dict]):
+    """
+    Retorna: (state, state_score, reason)
+    Estados:
+      - ESTAVEL
+      - EM_OBSERVACAO
+      - COMPENSANDO
+      - EM_RISCO
+      - INSTABILIZANDO
+      - CRITICO
+    """
+    reasons = []
+    score = 0
+
+    # ===== dados atuais (snapshot) =====
+    temp = _safe_num(snapshot.get("temp"))
+    pas  = _safe_num(snapshot.get("pas"))
+    pad  = _safe_num(snapshot.get("pad"))
+    fc   = _safe_num(snapshot.get("fc"))
+    fr   = _safe_num(snapshot.get("fr"))
+    spo2 = _safe_num(snapshot.get("spo2"))
+    uso_o2 = (snapshot.get("uso_o2") or "").strip().lower()
+    nivel = (snapshot.get("nivel_consciencia") or "").strip().lower()
+
+    # ===== helpers de tendência/persistência =====
+    def series(field):
+        vals = [h.get(field) for h in history if h.get(field) is not None]
+        return vals
+
+    def delta(field):
+        vals = series(field)
+        if len(vals) < 2:
+            return 0
+        return vals[-1] - vals[0]
+
+    def last(field):
+        vals = series(field)
+        return vals[-1] if vals else None
+
+    def minv(field):
+        vals = series(field)
+        return min(vals) if vals else None
+
+    def maxv(field):
+        vals = series(field)
+        return max(vals) if vals else None
+
+    # Persistência simples: quantas leituras anormais em sequência (últimas 3)
+    def persist_low_spo2(th=94):
+        vals = series("spo2")
+        tail = vals[-3:] if len(vals) >= 3 else vals
+        return sum(1 for v in tail if v < th)
+
+    def persist_high_fr(th=22):
+        vals = series("fr")
+        tail = vals[-3:] if len(vals) >= 3 else vals
+        return sum(1 for v in tail if v > th)
+
+    def persist_high_fc(th=110):
+        vals = series("fc")
+        tail = vals[-3:] if len(vals) >= 3 else vals
+        return sum(1 for v in tail if v > th)
+
+    # ===== Regras de estado (pensamento clínico) =====
+    # 1) CRÍTICO (ameaça imediata)
+    critical_hits = 0
+    if spo2 is not None and spo2 < 90:
+        critical_hits += 1
+        reasons.append(f"SpO2 muito baixa ({spo2})")
+    if pas is not None and pas < 85:
+        critical_hits += 1
+        reasons.append(f"PAS muito baixa ({pas})")
+    if fc is not None and fc >= 140:
+        critical_hits += 1
+        reasons.append(f"FC muito alta ({fc})")
+    if fr is not None and fr >= 30:
+        critical_hits += 1
+        reasons.append(f"FR muito alta ({fr})")
+    if temp is not None and (temp < 35 or temp >= 39):
+        critical_hits += 1
+        reasons.append(f"Temperatura crítica ({temp})")
+    if nivel in ["inconsciente", "rebaixado importante", "coma"]:
+        critical_hits += 1
+        reasons.append(f"Consciência crítica ({nivel})")
+
+    if critical_hits >= 2:
+        # estado crítico com múltiplos sistemas envolvidos
+        score = 90 + min(10, critical_hits * 2)
+        return "CRITICO", min(score, 100), " | ".join(reasons)
+
+    # 2) INSTABILIZANDO (já fora do normal + tendência/persistência)
+    # foco: sinais compensatórios e piora progressiva
+    if delta("spo2") <= -3 and (spo2 is not None and spo2 < 94):
+        score += 25
+        reasons.append("Queda progressiva de SpO2 + valor baixo")
+    if delta("fc") >= 15 and (fc is not None and fc > 100):
+        score += 15
+        reasons.append("FC em subida + taquicardia")
+    if delta("fr") >= 5 and (fr is not None and fr > 20):
+        score += 15
+        reasons.append("FR em subida + taquipneia")
+    if delta("pas") <= -20 and (pas is not None and pas < 95):
+        score += 20
+        reasons.append("Queda progressiva de PAS + PAS baixa")
+
+    if persist_low_spo2(94) >= 2:
+        score += 15
+        reasons.append("SpO2 baixa persistente (últimas medições)")
+    if persist_high_fr(22) >= 2:
+        score += 10
+        reasons.append("FR alta persistente (últimas medições)")
+    if persist_high_fc(110) >= 2:
+        score += 10
+        reasons.append("FC alta persistente (últimas medições)")
+
+    # uso de O2 + piora sugere risco de deterioração respiratória
+    if uso_o2 in ["sim", "cateter", "mascara", "venturi", "o2"] and delta("spo2") < 0:
+        score += 10
+        reasons.append("Uso de O2 com piora de SpO2")
+
+    # Se score já subiu bastante, classifica como INSTABILIZANDO
+    if score >= 45:
+        return "INSTABILIZANDO", min(score + 35, 100), " | ".join(reasons)
+
+    # 3) EM_RISCO (alteração relevante sem franca instabilidade)
+    if spo2 is not None and spo2 < 94:
+        score += 20
+        reasons.append(f"SpO2 baixa ({spo2})")
+    if fc is not None and fc > 110:
+        score += 15
+        reasons.append(f"Taquicardia ({fc})")
+    if fr is not None and fr > 22:
+        score += 10
+        reasons.append(f"Taquipneia ({fr})")
+    if pas is not None and pas < 90:
+        score += 20
+        reasons.append(f"Hipotensão (PAS {pas})")
+    if temp is not None and temp >= 38:
+        score += 10
+        reasons.append(f"Febre ({temp})")
+
+    if score >= 30:
+        return "EM_RISCO", min(score + 15, 100), " | ".join(reasons)
+
+    # 4) COMPENSANDO (valores quase normais, mas tendência/persistência sugere compensação)
+    comp = 0
+    if delta("fc") >= 10:
+        comp += 1
+        reasons.append("FC subindo (compensação)")
+    if delta("fr") >= 4:
+        comp += 1
+        reasons.append("FR subindo (compensação)")
+    if delta("spo2") < 0:
+        comp += 1
+        reasons.append("SpO2 caindo (compensação)")
+    if pas is not None and pas < 100 and (delta("pas") < 0):
+        comp += 1
+        reasons.append("PAS em queda (compensação)")
+
+    if comp >= 2:
+        return "COMPENSANDO", 35, " | ".join(reasons)
+
+    # 5) EM_OBSERVACAO (pequenas alterações, sem tendência forte)
+    if (spo2 is not None and 94 <= spo2 < 96) or (fc is not None and 95 <= fc <= 110) or (fr is not None and 19 <= fr <= 22):
+        reasons.append("Pequenas alterações: manter observação e reavaliar")
+        return "EM_OBSERVACAO", 20, " | ".join(reasons)
+
+    # 6) ESTÁVEL
+    return "ESTAVEL", 10, "Sinais dentro do esperado sem tendência de piora"
+
+
+
 
