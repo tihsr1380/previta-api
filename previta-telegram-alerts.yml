@@ -1,0 +1,16 @@
+name: PREVITA - Alertas Telegram (2 em 2 minutos)
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+
+jobs:
+  send-alerts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Chamar API PREVITA (Telegram Alerts)
+        run: |
+          curl -X POST "https://previta-api.onrender.com/v1/notify/telegram/run" \
+            -H "Content-Type: application/json"
