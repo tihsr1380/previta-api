@@ -1018,7 +1018,9 @@ def run_recommendations(minutes_back: int = 180, limit: int = 1000):
         conn = get_conn()
         cur = conn.cursor()
 
-        last_snapshot = get_last_snapshot_ts(cur)
+        # tempo clínico (não NOW())
+        cur.execute("SELECT MAX(snapshot_ts) FROM public.vitals_snapshot;")
+        last_snapshot = cur.fetchone()[0]
         if not last_snapshot:
             return {"ok": True, "processed": 0, "upserted": 0, "reason": "Sem snapshots em vitals_snapshot"}
 
@@ -1028,11 +1030,15 @@ def run_recommendations(minutes_back: int = 180, limit: int = 1000):
                 s.snapshot_ts,
                 s.state,
                 t.trend_state,
-                v.spo2,
-                v.fr,
-                v.fc,
-                v.pas,
-                v.uso_o2
+                COALESCE(v.spo2, NULL) AS spo2,
+                COALESCE(v.fr, NULL)   AS fr,
+                COALESCE(v.fc, NULL)   AS fc,
+                COALESCE(v.pas, NULL)  AS pas,
+                COALESCE(v.pad, NULL)  AS pad,
+                COALESCE(v.temp, NULL) AS temp,
+                COALESCE(v.dor, NULL)  AS dor,
+                v.uso_o2,
+                v.nivel_consciencia
             FROM public.clinical_state s
             LEFT JOIN public.clinical_trends t
               ON t.cod_atendimento = s.cod_atendimento
@@ -1040,80 +1046,218 @@ def run_recommendations(minutes_back: int = 180, limit: int = 1000):
             LEFT JOIN public.vitals_snapshot v
               ON v.cod_atendimento = s.cod_atendimento
              AND v.snapshot_ts = s.snapshot_ts
-            WHERE s.snapshot_ts >= (
-    (SELECT MAX(snapshot_ts) FROM public.vitals_snapshot)
-    - (%s || ' minutes')::interval
-)
-
+            WHERE s.snapshot_ts >= (%s - (%s || ' minutes')::interval)
             ORDER BY s.snapshot_ts DESC
             LIMIT %s;
         """, (last_snapshot, minutes_back, limit))
 
         rows = cur.fetchall()
-        inserted = 0
+        upserted = 0
 
         for r in rows:
             (
                 cod_atendimento, snapshot_ts, state, trend_state,
-                spo2, fr, fc, pas, uso_o2
+                spo2, fr, fc, pas, pad, temp, dor,
+                uso_o2, nivel_consciencia
             ) = r
 
-            level = "ATENCAO"
-            recommendation = "Manter rotina assistencial e reavaliar conforme protocolo."
+            # normalização
+            st = (state or "").upper()
+            tr = (trend_state or "").upper()
+            uso = (uso_o2 or "").strip().lower()
+            niv = (nivel_consciencia or "").strip().lower()
 
-            # IMEDIATO
+            # defaults
+            level = "ATENCAO"
+            syndrome = "ROTINA"
+            confidence = 30
+            recommendation = "Manter rotina assistencial e reavaliar conforme protocolo."
+            actions = "Reavaliar sinais vitais conforme rotina do setor. Documentar evolução."
+
+            # =========================
+            # Motor de Síndromes (E5.2)
+            # =========================
+
+            # 1) Falência respiratória precoce / deterioração respiratória
+            resp_hits = 0
+            if spo2 is not None and spo2 < 92: resp_hits += 1
+            if fr is not None and fr >= 24: resp_hits += 1
+            if uso in ["sim", "s", "cateter", "mascara", "venturi", "o2", "uso"]: resp_hits += 1
+            if tr == "PIORA" and spo2 is not None and spo2 < 94: resp_hits += 1
+
+            # 2) Choque/hipoperfusão (sangramento/desidratação/vasodilatação)
+            shock_hits = 0
+            if pas is not None and pas <= 90: shock_hits += 1
+            if fc is not None and fc >= 120: shock_hits += 1
+            if tr == "PIORA" and pas is not None and pas < 95: shock_hits += 1
+
+            # 3) Sepse / inflamação sistêmica (screening inicial)
+            sepsis_hits = 0
+            if temp is not None and temp >= 38: sepsis_hits += 1
+            if fc is not None and fc >= 110: sepsis_hits += 1
+            if tr == "PIORA": sepsis_hits += 1
+
+            # 4) Dor descontrolada (impacto hemodinâmico e risco de sangramento)
+            pain_hits = 0
+            if dor is not None and dor >= 7: pain_hits += 1
+            if fc is not None and fc >= 110: pain_hits += 1
+            if pas is not None and pas >= 160: pain_hits += 1  # se você usa PAS alta como risco
+
+            # 5) Neurológico/sedação (consciência alterada)
+            neuro_hits = 0
+            if niv in ["sonolenta", "confuso", "rebaixado", "rebaixado importante", "inconsciente"]: neuro_hits += 1
+            if spo2 is not None and spo2 < 94: neuro_hits += 1
+            if fr is not None and fr <= 10: neuro_hits += 1
+
+            # =========================
+            # Priorização (ordem importa)
+            # =========================
+
+            # IMEDIATO - risco direto/ameaça
             if (
-                (state or "").upper() == "CRITICO"
-                or ((trend_state or "").upper() == "PIORA" and spo2 is not None and spo2 < 90)
-                or (fr is not None and fr >= 30)
+                st == "CRITICO"
+                or (resp_hits >= 3 and (spo2 is not None and spo2 < 90))
+                or (shock_hits >= 2 and (pas is not None and pas <= 85))
                 or (fc is not None and fc >= 180)
-                or (pas is not None and pas <= 85)
+                or (fr is not None and fr >= 30)
             ):
                 level = "IMEDIATO"
-                recommendation = (
-                    "Acionar médico imediatamente. "
-                    "Avaliar suporte ventilatório e hemodinâmico."
-                )
+                confidence = 90
 
-            # PRIORIDADE
+                # decide síndrome principal
+                if shock_hits >= resp_hits and shock_hits >= sepsis_hits and shock_hits >= neuro_hits:
+                    syndrome = "CHOQUE_HIPOPERFUSAO"
+                    recommendation = "Suspeita de hipoperfusão/choque. Acionar médico imediatamente."
+                    actions = (
+                        "1) Repetir PA/FC/SpO2 agora e em 5 min.\n"
+                        "2) Avaliar sangramento ativo, drenos, curativos, débito urinário (se houver).\n"
+                        "3) Garantir acesso venoso pérvio; preparar cristalóide conforme prescrição/protocolo.\n"
+                        "4) Acionar médico/plantonista imediatamente e registrar achados."
+                    )
+                elif resp_hits >= shock_hits and resp_hits >= sepsis_hits and resp_hits >= neuro_hits:
+                    syndrome = "DETERIORACAO_RESPIRATORIA"
+                    recommendation = "Suspeita de deterioração respiratória. Acionar médico imediatamente."
+                    actions = (
+                        "1) Checar oximetria e padrão respiratório agora.\n"
+                        "2) Elevar cabeceira, verificar via aérea e posicionamento.\n"
+                        "3) Conferir O2 (fluxo/dispositivo), considerar ajuste conforme protocolo.\n"
+                        "4) Reavaliar SpO2/FR em 5–10 min e acionar médico imediatamente.\n"
+                        "5) Registrar e manter monitorização contínua."
+                    )
+                elif neuro_hits >= 2:
+                    syndrome = "ALTERACAO_NEURO_SEDACAO"
+                    recommendation = "Alteração neurológica/sedação com risco. Acionar médico imediatamente."
+                    actions = (
+                        "1) Avaliar consciência (AVPU/Glasgow se aplicável) e sinais vitais.\n"
+                        "2) Checar FR e SpO2 continuamente.\n"
+                        "3) Revisar medicações sedativas/analgésicas recentes (registrar horário/dose).\n"
+                        "4) Acionar médico imediatamente."
+                    )
+                else:
+                    syndrome = "DETERIORACAO_AGUDA"
+                    recommendation = "Sinais de deterioração aguda. Acionar médico imediatamente."
+                    actions = (
+                        "1) Repetir sinais vitais imediatamente.\n"
+                        "2) Garantir monitorização contínua.\n"
+                        "3) Acionar médico/plantonista e registrar achados."
+                    )
+
+            # PRIORIDADE - precisa agir em minutos e reavaliar
             elif (
-                (state or "").upper() == "EM_OBSERVACAO"
-                or (trend_state or "").upper() == "PIORA"
-                or ((uso_o2 or "").strip() != "" and spo2 is not None and spo2 < 94)
+                resp_hits >= 2
+                or shock_hits >= 2
+                or sepsis_hits >= 2
+                or (tr == "PIORA")
+                or (st in ["EM_RISCO", "INSTABILIZANDO", "EM_OBSERVACAO"])
             ):
                 level = "PRIORIDADE"
-                recommendation = (
-                    "Manter monitorização contínua. "
-                    "Reavaliar sinais vitais em até 30 minutos "
-                    "e considerar avaliação médica."
-                )
+                confidence = 70
 
+                # síndrome mais provável
+                if resp_hits >= 2:
+                    syndrome = "RISCO_RESPIRATORIO"
+                    recommendation = "Risco respiratório em evolução. Reavaliar em até 15–30 min e considerar avaliação médica."
+                    actions = (
+                        "1) Reavaliar SpO2/FR em 15 min.\n"
+                        "2) Verificar necessidade/aderência ao O2 (se em uso).\n"
+                        "3) Orientar posicionamento e monitorização contínua.\n"
+                        "4) Se SpO2 cair ou FR subir, escalar para IMEDIATO."
+                    )
+                elif shock_hits >= 2:
+                    syndrome = "RISCO_HIPOPERFUSAO"
+                    recommendation = "Risco hemodinâmico. Reavaliar em até 15–30 min e considerar avaliação médica."
+                    actions = (
+                        "1) Repetir PA/FC em 15 min.\n"
+                        "2) Verificar sangramento, diurese e perfusão periférica.\n"
+                        "3) Se PAS cair/FC subir, escalar para IMEDIATO."
+                    )
+                elif sepsis_hits >= 2:
+                    syndrome = "RISCO_INFECCIOSO"
+                    recommendation = "Sinais compatíveis com resposta inflamatória/infecciosa. Reavaliar em 30 min e considerar avaliação médica."
+                    actions = (
+                        "1) Repetir temperatura e FC em 30 min.\n"
+                        "2) Avaliar foco (ferida, drenos, queixas, calafrios).\n"
+                        "3) Se piora progressiva, escalar para avaliação médica."
+                    )
+                elif pain_hits >= 2:
+                    syndrome = "DOR_DESCONTROLADA"
+                    recommendation = "Dor descontrolada com repercussão. Reavaliar analgesia e sinais vitais."
+                    actions = (
+                        "1) Reavaliar dor e sinais vitais em 30 min.\n"
+                        "2) Checar analgesia prescrita e adesão.\n"
+                        "3) Se PA/FC persistirem elevadas, comunicar médico."
+                    )
+                else:
+                    syndrome = "ATENCAO_TENDENCIA"
+                    recommendation = "Tendência de piora detectada. Reavaliar e considerar avaliação médica."
+                    actions = (
+                        "1) Reavaliar sinais vitais em 30 min.\n"
+                        "2) Manter monitorização e documentar evolução.\n"
+                        "3) Se tendência persistir, escalar."
+                    )
+
+            # ATENÇÃO / ROTINA
+            else:
+                syndrome = "ROTINA"
+                level = "ATENCAO"
+                confidence = 40
+                recommendation = "Sem sinais de deterioração iminente no recorte atual. Manter rotina e reavaliar."
+                actions = "Reavaliar sinais vitais conforme rotina. Documentar evolução. Se houver queixa clínica, reavaliar antes."
+
+            # UPSERT com novos campos (syndrome/actions/confidence)
             cur.execute("""
                 INSERT INTO public.clinical_recommendations
                   (cod_atendimento, snapshot_ts, state, trend_state,
-                   recommendation_level, recommendation)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                   recommendation_level, recommendation,
+                   syndrome, actions, confidence)
+                VALUES (%s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s)
                 ON CONFLICT (cod_atendimento, snapshot_ts)
                 DO UPDATE SET
                   recommendation_level = EXCLUDED.recommendation_level,
                   recommendation = EXCLUDED.recommendation,
-                  created_at = CURRENT_TIMESTAMP;
+                  syndrome = EXCLUDED.syndrome,
+                  actions = EXCLUDED.actions,
+                  confidence = EXCLUDED.confidence,
+                  updated_at = CURRENT_TIMESTAMP;
             """, (
                 cod_atendimento, snapshot_ts, state, trend_state,
-                level, recommendation
+                level, recommendation,
+                syndrome, actions, int(confidence or 0)
             ))
 
-            inserted += 1
+            upserted += 1
 
         conn.commit()
         cur.close()
         conn.close()
 
-        return {"ok": True, "processed": len(rows), "upserted": inserted}
+        return {"ok": True, "processed": len(rows), "upserted": upserted}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        from fastapi import Query
+
 
 @app.get("/v1/assist/recommendations")
 def list_recommendations(
@@ -1311,6 +1455,7 @@ def update_recommendation(rec_id: int, payload: RecUpdateIn):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
