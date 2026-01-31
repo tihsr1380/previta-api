@@ -427,3 +427,100 @@ def update_alert(alert_id: int, payload: AlertUpdateIn):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+from typing import Optional
+from pydantic import BaseModel
+
+class AlertStatusIn(BaseModel):
+    status: str  # "EM_ATENDIMENTO" ou "RESOLVIDO"
+    note: Optional[str] = None  # opcional (observação)
+
+@app.get("/v1/alerts")
+def list_alerts(status: str = "NOVO", limit: int = 50):
+    """
+    Lista alertas por status. Ex:
+      /v1/alerts?status=NOVO&limit=50
+      /v1/alerts?status=EM_ATENDIMENTO
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, event_ts, cod_atendimento, risk_level, risk_score, risk_reason, status, created_at, updated_at
+            FROM public.alerts
+            WHERE status = %s
+            ORDER BY created_at DESC
+            LIMIT %s;
+        """, (status.upper(), limit))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "event_ts": r[1].isoformat() if r[1] else None,
+                "cod_atendimento": r[2],
+                "risk_level": r[3],
+                "risk_score": r[4],
+                "risk_reason": r[5],
+                "status": r[6],
+                "created_at": r[7].isoformat() if r[7] else None,
+                "updated_at": r[8].isoformat() if r[8] else None,
+            })
+
+        return {"ok": True, "count": len(items), "items": items}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/v1/alerts/{alert_id}")
+def update_alert_status(alert_id: int, payload: AlertStatusIn):
+    """
+    Atualiza status de um alerta.
+    status permitido: EM_ATENDIMENTO, RESOLVIDO
+    """
+    st = (payload.status or "").upper().strip()
+    if st not in ("EM_ATENDIMENTO", "RESOLVIDO"):
+        raise HTTPException(status_code=400, detail="status inválido. Use EM_ATENDIMENTO ou RESOLVIDO.")
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # opcional: se quiser salvar note no futuro, criamos coluna depois.
+        # por enquanto só status + updated_at
+        cur.execute("""
+            UPDATE public.alerts
+            SET status = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING id, cod_atendimento, status, updated_at;
+        """, (st, alert_id))
+
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="alerta não encontrado")
+
+        return {
+            "ok": True,
+            "id": row[0],
+            "cod_atendimento": row[1],
+            "status": row[2],
+            "updated_at": row[3].isoformat() if row[3] else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
