@@ -802,6 +802,229 @@ def state_run(p: StateRunIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =========================
+# E2 — Clinical Trends Engine
+# =========================
+
+class TrendsRunIn(BaseModel):
+    minutes_back: int = 1440        # quantos minutos pra trás pegar snapshots (24h)
+    history_minutes: int = 360      # janela de histórico para tendência (6h)
+    limit: int = 500                # limite de pacientes/snapshots processados
+
+
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def calc_trends(snapshot: dict, history: list[dict]):
+    """
+    Retorna (trend_state, trend_score, trend_reason)
+    trend_state: ESTAVEL | ATENCAO | PIORA
+    """
+    score = 0
+    reasons = []
+
+    def series(field):
+        vals = []
+        for h in history:
+            v = h.get(field)
+            if v is None:
+                continue
+            vals.append(float(v))
+        return vals
+
+    def slope(field):
+        vals = series(field)
+        if len(vals) < 2:
+            return 0.0
+        return vals[-1] - vals[0]  # variação na janela
+
+    # ----- deltas (tendências) -----
+    d_spo2 = slope("spo2")
+    d_fc   = slope("fc")
+    d_fr   = slope("fr")
+    d_pas  = slope("pas")
+    d_temp = slope("temp")
+
+    # ----- valores atuais (do snapshot) -----
+    spo2 = _safe_float(snapshot.get("spo2"))
+    fc   = _safe_float(snapshot.get("fc"))
+    fr   = _safe_float(snapshot.get("fr"))
+    pas  = _safe_float(snapshot.get("pas"))
+    temp = _safe_float(snapshot.get("temp"))
+
+    uso_o2 = (snapshot.get("uso_o2") or "").lower()
+    nivel  = (snapshot.get("nivel_consciencia") or "").lower()
+
+    # ===== Regras de tendência (disruptivo: antecipação) =====
+    # 1) Respiratório piorando (mesmo antes de ficar crítico)
+    if d_spo2 <= -3:
+        score += 25
+        reasons.append("SpO2 em queda (tendência)")
+
+    if d_fr >= 5:
+        score += 15
+        reasons.append("FR em subida (tendência)")
+
+    # “combo”: SpO2 caindo + FR subindo = forte sinal precoce
+    if d_spo2 <= -2 and d_fr >= 3:
+        score += 20
+        reasons.append("Piora respiratória combinada (SpO2↓ + FR↑)")
+
+    # O2 em uso e ainda assim SpO2 piora
+    if uso_o2 in ["aa", "sim", "s", "uso"] and d_spo2 < 0:
+        score += 10
+        reasons.append("Uso de O2 + SpO2 piorando")
+
+    # 2) Hemodinâmica piorando
+    if d_pas <= -20:
+        score += 20
+        reasons.append("PAS em queda progressiva")
+
+    # 3) Estresse sistêmico / infeccioso
+    if d_temp >= 1.0:
+        score += 10
+        reasons.append("Temperatura em elevação progressiva")
+
+    # 4) Taquicardia progressiva
+    if d_fc >= 15:
+        score += 15
+        reasons.append("FC em aumento progressivo")
+
+    # 5) Estado neurológico (alerta precoce)
+    if nivel in ["sonolenta", "confuso", "rebaixado"]:
+        score += 15
+        reasons.append("Consciência alterada (sinal precoce)")
+
+    # ===== Ajustes por “perigo silencioso” mesmo sem tendência =====
+    # (ex.: valores fora do normal mas ainda não críticos)
+    if spo2 is not None and 92 <= spo2 <= 94:
+        score += 10
+        reasons.append(f"SpO2 limítrofe ({spo2})")
+
+    if fr is not None and 20 <= fr <= 22:
+        score += 5
+        reasons.append(f"FR limítrofe ({fr})")
+
+    if fc is not None and 100 <= fc <= 110:
+        score += 5
+        reasons.append(f"FC limítrofe ({fc})")
+
+    # ===== Classificação =====
+    if score >= 45:
+        state = "PIORA"
+    elif score >= 20:
+        state = "ATENCAO"
+    else:
+        state = "ESTAVEL"
+
+    if not reasons:
+        reasons = ["Sem tendência relevante de piora na janela analisada"]
+
+    return state, min(score, 100), " | ".join(reasons)
+
+
+@app.post("/v1/trends/run")
+def run_trends(p: TrendsRunIn):
+    """
+    Gera tendências por snapshot:
+    - pega vitals_snapshot recentes
+    - busca histórico (vitals_raw) por paciente
+    - grava em clinical_trends
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # 1) snapshots recentes
+        cur.execute("""
+            SELECT cod_atendimento, snapshot_ts, id_ricadpac,
+                   temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia
+            FROM public.vitals_snapshot
+            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+            ORDER BY snapshot_ts DESC
+            LIMIT %s;
+        """, (p.minutes_back, p.limit))
+        snaps = cur.fetchall()
+
+        upserted = 0
+
+        # 2) para cada snapshot, carrega histórico do mesmo paciente em vitals_raw
+        for s in snaps:
+            cod_atendimento = s[0]
+            snapshot_ts     = s[1]
+
+            snapshot = {
+                "cod_atendimento": cod_atendimento,
+                "snapshot_ts": snapshot_ts,
+                "id_ricadpac": s[2],
+                "temp": s[3],
+                "pas": s[4],
+                "pad": s[5],
+                "fc": s[6],
+                "fr": s[7],
+                "spo2": s[8],
+                "dor": s[9],
+                "uso_o2": s[10],
+                "nivel_consciencia": s[11],
+            }
+
+            cur.execute("""
+                SELECT event_ts, temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia
+                FROM public.vitals_raw
+                WHERE cod_atendimento = %s
+                  AND event_ts >= (%s - (%s || ' minutes')::interval)
+                  AND event_ts <= %s
+                ORDER BY event_ts ASC;
+            """, (cod_atendimento, snapshot_ts, p.history_minutes, snapshot_ts))
+            hist_rows = cur.fetchall()
+
+            history = []
+            for h in hist_rows:
+                history.append({
+                    "event_ts": h[0],
+                    "temp": h[1],
+                    "pas": h[2],
+                    "pad": h[3],
+                    "fc": h[4],
+                    "fr": h[5],
+                    "spo2": h[6],
+                    "dor": h[7],
+                    "uso_o2": h[8],
+                    "nivel_consciencia": h[9],
+                })
+
+            trend_state, trend_score, trend_reason = calc_trends(snapshot, history)
+
+            cur.execute("""
+                INSERT INTO public.clinical_trends
+                  (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason)
+                VALUES
+                  (%s, %s, %s, %s, %s)
+                ON CONFLICT (cod_atendimento, snapshot_ts)
+                DO UPDATE SET
+                  trend_state = EXCLUDED.trend_state,
+                  trend_score = EXCLUDED.trend_score,
+                  trend_reason = EXCLUDED.trend_reason,
+                  created_at = CURRENT_TIMESTAMP;
+            """, (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason))
+
+            upserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "processed": len(snaps), "upserted": upserted}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
