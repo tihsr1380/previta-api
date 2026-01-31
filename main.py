@@ -1180,5 +1180,133 @@ def list_recommendations(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+from fastapi import Body
+
+class RecUpdateIn(BaseModel):
+    status: Literal["NOVO", "EM_ATENDIMENTO", "RESOLVIDO"]
+    handled_by: Optional[str] = None
+    handled_note: Optional[str] = None
+
+
+@app.get("/v1/assist/recommendations")
+def list_recommendations(
+    status: str = Query(default="NOVO", description="NOVO | EM_ATENDIMENTO | RESOLVIDO"),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """
+    Lista recomendações assistenciais por status (padrão NOVO).
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT
+              id,
+              cod_atendimento,
+              snapshot_ts,
+              state,
+              trend_state,
+              recommendation_level,
+              recommendation,
+              status,
+              created_at,
+              updated_at,
+              handled_at,
+              handled_by,
+              handled_note
+            FROM public.clinical_recommendations
+            WHERE status = %s
+            ORDER BY created_at DESC
+            LIMIT %s;
+        """, (status.upper().strip(), limit))
+
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "cod_atendimento": r[1],
+                "snapshot_ts": r[2].isoformat() if r[2] else None,
+                "state": r[3],
+                "trend_state": r[4],
+                "recommendation_level": r[5],
+                "recommendation": r[6],
+                "status": r[7],
+                "created_at": r[8].isoformat() if r[8] else None,
+                "updated_at": r[9].isoformat() if r[9] else None,
+                "handled_at": r[10].isoformat() if r[10] else None,
+                "handled_by": r[11],
+                "handled_note": r[12],
+            })
+
+        return {"ok": True, "count": len(items), "items": items}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/v1/assist/recommendations/{rec_id}")
+def update_recommendation(rec_id: int, payload: RecUpdateIn):
+    """
+    Atualiza status da recomendação assistencial:
+      - EM_ATENDIMENTO: marca updated_at
+      - RESOLVIDO: marca handled_at + handled_by + handled_note + updated_at
+    """
+    st = payload.status.upper().strip()
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        if st == "RESOLVIDO":
+            cur.execute("""
+                UPDATE public.clinical_recommendations
+                SET status = %s,
+                    handled_at = CURRENT_TIMESTAMP,
+                    handled_by = %s,
+                    handled_note = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, cod_atendimento, status, updated_at, handled_at;
+            """, (st, payload.handled_by, payload.handled_note, rec_id))
+        else:
+            cur.execute("""
+                UPDATE public.clinical_recommendations
+                SET status = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING id, cod_atendimento, status, updated_at;
+            """, (st, rec_id))
+
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="recomendação não encontrada")
+
+        # resposta
+        resp = {
+            "ok": True,
+            "id": row[0],
+            "cod_atendimento": row[1],
+            "status": row[2],
+            "updated_at": row[3].isoformat() if row[3] else None,
+        }
+        if st == "RESOLVIDO":
+            resp["handled_at"] = row[4].isoformat() if row[4] else None
+
+        return resp
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
