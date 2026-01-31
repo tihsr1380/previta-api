@@ -1099,6 +1099,67 @@ def early_alerts_check(p: EarlyAlertsIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+from pydantic import BaseModel
+
+class AssistAlertsIn(BaseModel):
+    minutes_back: int = 360          # olha tendências das últimas 6h
+    min_score: int = 60              # só dispara se trend_score >= 60
+    include_states: list[str] = ["PIORA", "CRITICO"]  # quais tendências viram alerta
+
+@app.post("/v1/assist/alerts/run")
+def assist_alerts_run(p: AssistAlertsIn):
+    """
+    Promove tendências (clinical_trends) para alertas assistenciais (assistential_alerts),
+    sem duplicar alerta ativo por paciente (graças ao índice uq_assist_alert_active).
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason
+            FROM public.clinical_trends
+            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+              AND trend_state = ANY(%s)
+              AND trend_score >= %s
+            ORDER BY snapshot_ts DESC;
+        """, (p.minutes_back, p.include_states, p.min_score))
+
+        rows = cur.fetchall()
+
+        inserted = 0
+        skipped = 0
+
+        for (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason) in rows:
+            # Mapeia tendência -> nível de alerta
+            if (trend_state or "").upper() == "CRITICO":
+                alert_level = "CRITICO"
+            else:
+                alert_level = "ATENCAO"
+
+            # Tenta criar alerta ativo; se já existir (unique index), ignora
+            cur.execute("""
+                INSERT INTO public.assistential_alerts
+                  (cod_atendimento, snapshot_ts, alert_level, alert_score, alert_reason, status)
+                VALUES
+                  (%s, %s, %s, %s, %s, 'NOVO')
+                ON CONFLICT ON CONSTRAINT uq_assist_alert_active DO NOTHING;
+            """, (cod_atendimento, snapshot_ts, alert_level, int(trend_score or 0), trend_reason or ""))
+
+            if cur.rowcount == 1:
+                inserted += 1
+            else:
+                skipped += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "scanned": len(rows), "inserted": inserted, "skipped_active": skipped}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
