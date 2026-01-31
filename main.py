@@ -4,7 +4,28 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, Literal
 
+
 app = FastAPI(title="PREVITA API", version="1.0.0")
+import requests
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+def send_telegram_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não configurados")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error: {r.status_code} {r.text}")
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -1623,6 +1644,7 @@ def dispatch_mark(p: DispatchMarkIn):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
