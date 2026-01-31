@@ -1025,6 +1025,79 @@ def run_trends(p: TrendsRunIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# =========================
+# E2.3 — Early Alerts (Trend-based)
+# =========================
+
+class EarlyAlertsIn(BaseModel):
+    minutes_back: int = 1440
+    min_trend_state: str = "ATENCAO"   # ATENCAO ou PIORA
+    exclude_state: str | None = None  # opcional: "CRITICO" para não duplicar com alertas críticos
+
+
+@app.post("/v1/early-alerts/check")
+def early_alerts_check(p: EarlyAlertsIn):
+    rank = {"ESTAVEL": 1, "ATENCAO": 2, "PIORA": 3}
+    min_rank = rank.get(p.min_trend_state.upper(), 2)
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # Pega tendências recentes
+        cur.execute("""
+            SELECT t.snapshot_ts, t.cod_atendimento, t.trend_state, t.trend_score, t.trend_reason
+            FROM public.clinical_trends t
+            WHERE t.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+            ORDER BY t.snapshot_ts DESC;
+        """, (p.minutes_back,))
+        trends = cur.fetchall()
+
+        inserted = 0
+        scanned = 0
+
+        for snapshot_ts, cod_atendimento, trend_state, trend_score, trend_reason in trends:
+            scanned += 1
+            ts = (trend_state or "").upper()
+
+            if rank.get(ts, 0) < min_rank:
+                continue
+
+            # (Opcional) não gerar alerta de tendência se já estiver CRITICO no clinical_state
+            if p.exclude_state:
+                cur.execute("""
+                    SELECT state
+                    FROM public.clinical_state
+                    WHERE cod_atendimento = %s AND snapshot_ts = %s
+                    LIMIT 1;
+                """, (cod_atendimento, snapshot_ts))
+                r = cur.fetchone()
+                if r and (r[0] or "").upper() == p.exclude_state.upper():
+                    continue
+
+            alert_level = ts  # ATENCAO ou PIORA
+
+            cur.execute("""
+                INSERT INTO public.early_alerts
+                  (snapshot_ts, cod_atendimento, alert_level, alert_score, alert_reason)
+                VALUES
+                  (%s, %s, %s, %s, %s)
+                ON CONFLICT (cod_atendimento, snapshot_ts, alert_level)
+                DO NOTHING;
+            """, (snapshot_ts, cod_atendimento, alert_level, int(trend_score or 0), trend_reason or ""))
+
+            if cur.rowcount == 1:
+                inserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "scanned": scanned, "inserted": inserted}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
