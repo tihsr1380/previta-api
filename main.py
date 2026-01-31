@@ -701,6 +701,108 @@ def calc_state(snapshot: dict, history: list[dict]):
     # 6) ESTÁVEL
     return "ESTAVEL", 10, "Sinais dentro do esperado sem tendência de piora"
 
+@app.post("/v1/state/run")
+def state_run(p: StateRunIn):
+    """
+    Calcula clinical_state com base em vitals_snapshot (estado atual)
+    + histórico recente em vitals_raw (tendência/persistência).
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        # snapshots recentes (ancorado no max(snapshot_ts) para evitar problema de timezone)
+        cur.execute("""
+            SELECT cod_atendimento, snapshot_ts, id_ricadpac,
+                   temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia, profissional
+            FROM public.vitals_snapshot
+            WHERE snapshot_ts >= (
+                (SELECT max(snapshot_ts) FROM public.vitals_snapshot)
+                - (%s || ' minutes')::interval
+            )
+            ORDER BY snapshot_ts DESC
+            LIMIT %s;
+        """, (p.minutes_back, p.limit))
+        snaps = cur.fetchall()
+
+        upserted = 0
+
+        for s in snaps:
+            snapshot = {
+                "cod_atendimento": s[0],
+                "snapshot_ts": s[1],
+                "id_ricadpac": s[2],
+                "temp": s[3],
+                "pas": s[4],
+                "pad": s[5],
+                "fc": s[6],
+                "fr": s[7],
+                "spo2": s[8],
+                "dor": s[9],
+                "uso_o2": s[10],
+                "nivel_consciencia": s[11],
+                "profissional": s[12],
+            }
+
+            # histórico do mesmo atendimento (ancorado no snapshot_ts)
+            cur.execute("""
+                SELECT event_ts, temp, pas, fc, fr, spo2
+                FROM public.vitals_raw
+                WHERE cod_atendimento = %s
+                  AND event_ts >= (%s - (%s || ' minutes')::interval)
+                  AND event_ts <= %s
+                ORDER BY event_ts ASC;
+            """, (snapshot["cod_atendimento"], snapshot["snapshot_ts"], p.history_minutes, snapshot["snapshot_ts"]))
+
+            hrows = cur.fetchall()
+            history = []
+            for hr in hrows:
+                history.append({
+                    "event_ts": hr[0],
+                    "temp": _safe_num(hr[1]),
+                    "pas": _safe_num(hr[2]),
+                    "fc": _safe_num(hr[3]),
+                    "fr": _safe_num(hr[4]),
+                    "spo2": _safe_num(hr[5]),
+                })
+
+            state, state_score, state_reason = calc_state(snapshot, history)
+
+            # upsert por atendimento + snapshot_ts
+            cur.execute("""
+                INSERT INTO public.clinical_state
+                  (cod_atendimento, id_ricadpac, snapshot_ts,
+                   state, state_score, state_reason)
+                VALUES
+                  (%s, %s, %s,
+                   %s, %s, %s)
+                ON CONFLICT (cod_atendimento, snapshot_ts)
+                DO UPDATE SET
+                  state = EXCLUDED.state,
+                  state_score = EXCLUDED.state_score,
+                  state_reason = EXCLUDED.state_reason,
+                  created_at = CURRENT_TIMESTAMP;
+            """, (
+                snapshot["cod_atendimento"],
+                snapshot["id_ricadpac"],
+                snapshot["snapshot_ts"],
+                state,
+                state_score,
+                state_reason
+            ))
+            upserted += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "processed": len(snaps), "upserted": upserted}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 
 
