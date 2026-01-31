@@ -369,8 +369,10 @@ def snapshot_run(p: SnapshotRunIn):
         WITH recent AS (
           SELECT *
           FROM public.vitals_raw
-          WHERE event_ts >= (NOW() - (%s || ' minutes')::interval)
-        ),
+          WHERE event_ts >= (
+  (SELECT max(event_ts) FROM public.vitals_raw)
+  - (%s || ' minutes')::interval
+),
 
         atend AS (
           SELECT DISTINCT cod_atendimento
@@ -504,5 +506,6 @@ def snapshot_run(p: SnapshotRunIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
