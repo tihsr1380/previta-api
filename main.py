@@ -1645,6 +1645,59 @@ def dispatch_mark(p: DispatchMarkIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/v1/notify/run")
+def notify_run(minutes_back: int = 1440, limit: int = 50):
+    """
+    Busca recomendações recentes e envia Telegram somente para:
+      - recommendation_level IN ('IMEDIATO','PRIORIDADE')
+    Envia apenas se notified_at IS NULL.
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions
+            FROM public.clinical_recommendations
+            WHERE snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+              AND recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+              AND notified_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT %s;
+        """, (minutes_back, limit))
+
+        rows = cur.fetchall()
+        sent = 0
+
+        for cod_atendimento, snapshot_ts, level, syndrome, confidence, actions in rows:
+            msg = (
+                f"🚨 <b>PREVITA ALERTA {level}</b>\n"
+                f"🧾 <b>Atendimento:</b> {cod_atendimento}\n"
+                f"🕒 <b>Snapshot:</b> {snapshot_ts}\n"
+                f"🧠 <b>Síndrome:</b> {syndrome or '-'}\n"
+                f"📌 <b>Confiança:</b> {confidence or '-'}\n\n"
+                f"✅ <b>Ações:</b>\n{(actions or '').strip()[:3500]}"
+            )
+
+            send_telegram_message(msg)
+
+            cur.execute("""
+                UPDATE public.clinical_recommendations
+                SET notified_at = CURRENT_TIMESTAMP
+                WHERE cod_atendimento = %s AND snapshot_ts = %s;
+            """, (cod_atendimento, snapshot_ts))
+
+            sent += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "sent": sent, "scanned": len(rows)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
