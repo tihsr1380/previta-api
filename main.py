@@ -267,3 +267,191 @@ async def notify_telegram_run(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================
+# PIPELINE - CÁLCULOS (regra clínica simplificada + segura)
+# ============================================================
+
+def _safe_float(x):
+    try:
+        return float(x) if x is not None else None
+    except:
+        return None
+
+def _severity_from_vitals(v: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Regras robustas para triagem (não substitui score oficial; serve para detecção precoce + recomendação).
+    Retorna:
+      - level: ESTAVEL | ATENCAO | PRIORIDADE | IMEDIATO
+      - flags: lista de achados
+      - score: inteiro (heurístico)
+    """
+    temp = _safe_float(v.get("temp"))
+    pas  = _safe_float(v.get("pas"))
+    pad  = _safe_float(v.get("pad"))
+    fc   = _safe_float(v.get("fc"))
+    fr   = _safe_float(v.get("fr"))
+    spo2 = _safe_float(v.get("spo2"))
+    dor  = _safe_float(v.get("dor"))
+
+    uso_o2 = (v.get("uso_o2") or "").strip().lower()
+    consc  = (v.get("nivel_consciencia") or "").strip().lower()
+
+    flags = []
+    score = 0
+
+    # Critérios IMEDIATO (ameaça imediata)
+    if spo2 is not None and spo2 < 90:
+        flags.append("SpO2 < 90% (hipoxemia grave)")
+        score += 6
+    if pas is not None and pas < 90:
+        flags.append("PAS < 90 (hipotensão)")
+        score += 6
+    if fr is not None and fr > 30:
+        flags.append("FR > 30 (taquipneia importante)")
+        score += 5
+    if fc is not None and fc > 140:
+        flags.append("FC > 140 (taquicardia importante)")
+        score += 5
+    if consc in ("rebaixado", "confuso", "inconsciente", "alerta?" , "somnolento"):
+        flags.append("Alteração de consciência relatada")
+        score += 5
+
+    # Critérios PRIORIDADE (alto risco)
+    if spo2 is not None and 90 <= spo2 <= 92:
+        flags.append("SpO2 90-92% (hipoxemia)")
+        score += 3
+    if pas is not None and 90 <= pas <= 100:
+        flags.append("PAS 90-100 (limítrofe)")
+        score += 2
+    if fr is not None and 21 <= fr <= 30:
+        flags.append("FR 21-30 (taquipneia)")
+        score += 2
+    if fc is not None and 111 <= fc <= 140:
+        flags.append("FC 111-140 (taquicardia)")
+        score += 2
+    if temp is not None and (temp >= 39.0 or temp <= 35.0):
+        flags.append("Temperatura crítica (>=39 ou <=35)")
+        score += 3
+
+    # ATENÇÃO (monitorar)
+    if temp is not None and (38.0 <= temp < 39.0):
+        flags.append("Febre (38-38.9)")
+        score += 1
+    if dor is not None and dor >= 7:
+        flags.append("Dor intensa (>=7)")
+        score += 1
+    if uso_o2 in ("sim", "s", "true", "1"):
+        flags.append("Em uso de O2")
+        score += 1
+
+    # Decide level
+    if score >= 10:
+        level = "IMEDIATO"
+    elif score >= 5:
+        level = "PRIORIDADE"
+    elif score >= 2:
+        level = "ATENCAO"
+    else:
+        level = "ESTAVEL"
+
+    return {"level": level, "flags": flags, "score": score}
+
+
+def _trend(prev: Optional[Dict[str, Any]], curr: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compara snapshot anterior vs atual e detecta piora/melhora.
+    """
+    if not prev:
+        return {"trend": "NOVO", "worsened": False, "improved": False, "delta": {}}
+
+    def d(key):
+        a = _safe_float(prev.get(key))
+        b = _safe_float(curr.get(key))
+        return None if a is None or b is None else (b - a)
+
+    delta = {
+        "temp": d("temp"),
+        "pas": d("pas"),
+        "pad": d("pad"),
+        "fc": d("fc"),
+        "fr": d("fr"),
+        "spo2": d("spo2"),
+        "dor": d("dor"),
+    }
+
+    worsened = False
+    improved = False
+
+    # pioras clinicamente relevantes
+    if delta["spo2"] is not None and delta["spo2"] <= -3:
+        worsened = True
+    if delta["pas"] is not None and delta["pas"] <= -10:
+        worsened = True
+    if delta["fc"] is not None and delta["fc"] >= 15:
+        worsened = True
+    if delta["fr"] is not None and delta["fr"] >= 5:
+        worsened = True
+    if delta["temp"] is not None and delta["temp"] >= 0.7:
+        worsened = True
+
+    # melhoras
+    if delta["spo2"] is not None and delta["spo2"] >= 3:
+        improved = True
+    if delta["pas"] is not None and delta["pas"] >= 10:
+        improved = True
+    if delta["fc"] is not None and delta["fc"] <= -15:
+        improved = True
+    if delta["fr"] is not None and delta["fr"] <= -5:
+        improved = True
+    if delta["temp"] is not None and delta["temp"] <= -0.7:
+        improved = True
+
+    if worsened and not improved:
+        t = "PIOROU"
+    elif improved and not worsened:
+        t = "MELHOROU"
+    elif improved and worsened:
+        t = "OSCILANTE"
+    else:
+        t = "ESTAVEL"
+
+    return {"trend": t, "worsened": worsened, "improved": improved, "delta": delta}
+
+
+def _recommendations(level: str, flags: List[str], trend: str) -> str:
+    """
+    Texto pronto (apoio a médico/enfermagem) – objetivo, acionável, sem exagero.
+    """
+    base = []
+    base.append(f"• Tendência: {trend}")
+    if flags:
+        base.append("• Achados:")
+        for f in flags[:12]:
+            base.append(f"  - {f}")
+    else:
+        base.append("• Sem achados críticos no momento.")
+
+    if level == "IMEDIATO":
+        base.append("\n✅ Conduta sugerida (apoio):")
+        base.append("1) Avaliação clínica imediata à beira-leito.")
+        base.append("2) Checar via aérea, oxigenação e perfusão; repetir sinais vitais.")
+        base.append("3) Considerar acionar médico responsável e equipe de resposta rápida conforme protocolo.")
+        base.append("4) Revisar analgesia/sedação, sangramento, sinais de sepse, broncoaspiração, eventos agudos.")
+    elif level == "PRIORIDADE":
+        base.append("\n✅ Conduta sugerida (apoio):")
+        base.append("1) Reavaliar paciente em até 10-15 min e repetir sinais vitais.")
+        base.append("2) Revisar necessidade de O2 e metas de SpO2 conforme contexto clínico.")
+        base.append("3) Se mantiver tendência de piora, escalar para avaliação médica.")
+    elif level == "ATENCAO":
+        base.append("\n✅ Orientações (apoio):")
+        base.append("1) Manter monitorização e reavaliar em 30-60 min.")
+        base.append("2) Verificar dor, febre, hidratação, ansiedade; checar posicionamento do sensor SpO2.")
+    else:
+        base.append("\n✅ Situação estável:")
+        base.append("1) Manter rotina assistencial e monitorização conforme prescrição.")
+        base.append("2) Registrar evolução e orientar paciente conforme protocolo.")
+
+    return "\n".join(base)
+
+
