@@ -128,10 +128,12 @@ def health():
 def ingest_vital(v: VitalIn):
     """
     Recebe vitais do Power Automate e grava em public.vitals_raw.
+    Após gravar, roda pipeline automaticamente para alimentar snapshot/estado/tendência/recomendações/alertas.
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 1) grava raw
                 cur.execute(
                     """
                     INSERT INTO public.vitals_raw
@@ -177,12 +179,22 @@ def ingest_vital(v: VitalIn):
                         v.profissional,
                     ),
                 )
+
+                # 2) pipeline automática
+                pipe = run_pipeline_for_patient(cur, v.cod_atendimento)
+
             conn.commit()
 
-        return {"ok": True, "message": "vital registrado", "cod_atendimento": v.cod_atendimento}
+        return {
+            "ok": True,
+            "message": "vital registrado + pipeline executada",
+            "cod_atendimento": v.cod_atendimento,
+            "pipeline": pipe,
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ============================================================
@@ -647,6 +659,7 @@ def run_pipeline_for_patient(cur, cod_atendimento: int) -> Dict[str, Any]:
         "score": sev["score"],
         "flags": sev["flags"],
     }
+
 
 
 
