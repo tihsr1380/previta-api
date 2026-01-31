@@ -348,3 +348,161 @@ def alerts_check(p: AlertsIn):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+from pydantic import BaseModel
+
+class SnapshotRunIn(BaseModel):
+    minutes_back: int = 180   # janela de captura (últimos X minutos)
+    limit_atend: int = 500    # limite de atendimentos processados por chamada
+
+@app.post("/v1/snapshot/run")
+def snapshot_run(p: SnapshotRunIn):
+    """
+    Consolida vitais_raw em 1 linha por atendimento (vitals_snapshot),
+    pegando o último valor NÃO NULO de cada sinal vital dentro da janela.
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        sql = """
+        WITH recent AS (
+          SELECT *
+          FROM public.vitals_raw
+          WHERE event_ts >= (NOW() - (%s || ' minutes')::interval)
+        ),
+
+        atend AS (
+          SELECT DISTINCT cod_atendimento
+          FROM recent
+          ORDER BY cod_atendimento
+          LIMIT %s
+        ),
+
+        last_event AS (
+          SELECT DISTINCT ON (r.cod_atendimento)
+            r.cod_atendimento,
+            r.event_ts AS snapshot_ts,
+            r.id_ricadpac,
+            r.profissional
+          FROM recent r
+          JOIN atend a ON a.cod_atendimento = r.cod_atendimento
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+
+        last_temp AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.temp
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.temp IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_pas AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.pas
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.pas IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_pad AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.pad
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.pad IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_fc AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.fc
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.fc IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_fr AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.fr
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.fr IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_spo2 AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.spo2
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.spo2 IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_dor AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.dor
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.dor IS NOT NULL
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_uso_o2 AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.uso_o2
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.uso_o2 IS NOT NULL AND r.uso_o2 <> ''
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        ),
+        last_nc AS (
+          SELECT DISTINCT ON (r.cod_atendimento) r.cod_atendimento, r.nivel_consciencia
+          FROM recent r JOIN atend a ON a.cod_atendimento=r.cod_atendimento
+          WHERE r.nivel_consciencia IS NOT NULL AND r.nivel_consciencia <> ''
+          ORDER BY r.cod_atendimento, r.event_ts DESC
+        )
+
+        INSERT INTO public.vitals_snapshot
+          (cod_atendimento, snapshot_ts, id_ricadpac,
+           temp, pas, pad, fc, fr, spo2, dor, uso_o2, nivel_consciencia,
+           profissional, updated_at)
+        SELECT
+          e.cod_atendimento,
+          e.snapshot_ts,
+          e.id_ricadpac,
+          t.temp,
+          ps.pas,
+          pd.pad,
+          f.fc,
+          fr.fr,
+          s.spo2,
+          d.dor,
+          u.uso_o2,
+          nc.nivel_consciencia,
+          e.profissional,
+          CURRENT_TIMESTAMP
+        FROM last_event e
+        LEFT JOIN last_temp t    ON t.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_pas  ps   ON ps.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_pad  pd   ON pd.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_fc   f    ON f.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_fr   fr   ON fr.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_spo2 s    ON s.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_dor  d    ON d.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_uso_o2 u  ON u.cod_atendimento = e.cod_atendimento
+        LEFT JOIN last_nc   nc   ON nc.cod_atendimento = e.cod_atendimento
+
+        ON CONFLICT (cod_atendimento)
+        DO UPDATE SET
+          snapshot_ts = EXCLUDED.snapshot_ts,
+          id_ricadpac = COALESCE(EXCLUDED.id_ricadpac, public.vitals_snapshot.id_ricadpac),
+
+          temp = COALESCE(EXCLUDED.temp, public.vitals_snapshot.temp),
+          pas  = COALESCE(EXCLUDED.pas,  public.vitals_snapshot.pas),
+          pad  = COALESCE(EXCLUDED.pad,  public.vitals_snapshot.pad),
+          fc   = COALESCE(EXCLUDED.fc,   public.vitals_snapshot.fc),
+          fr   = COALESCE(EXCLUDED.fr,   public.vitals_snapshot.fr),
+          spo2 = COALESCE(EXCLUDED.spo2, public.vitals_snapshot.spo2),
+          dor  = COALESCE(EXCLUDED.dor,  public.vitals_snapshot.dor),
+          uso_o2 = COALESCE(EXCLUDED.uso_o2, public.vitals_snapshot.uso_o2),
+          nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, public.vitals_snapshot.nivel_consciencia),
+
+          profissional = COALESCE(EXCLUDED.profissional, public.vitals_snapshot.profissional),
+          updated_at = CURRENT_TIMESTAMP;
+        """
+
+        cur.execute(sql, (p.minutes_back, p.limit_atend))
+        conn.commit()
+
+        cur.close()
+        conn.close()
+
+        return {"ok": True, "minutes_back": p.minutes_back, "limit_atend": p.limit_atend}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
