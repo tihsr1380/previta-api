@@ -1,0 +1,17 @@
+name: PREVITA Auto Alerts
+
+on:
+  schedule:
+    - cron: "*/1 * * * *"   # a cada 5 minutos
+  workflow_dispatch:        # permite rodar manualmente
+
+jobs:
+  run-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run PREVITA pipeline
+        run: |
+          curl -s -X POST "https://previta-api.onrender.com/v1/state/run"
+          curl -s -X POST "https://previta-api.onrender.com/v1/trends/run"
+          curl -s -X POST "https://previta-api.onrender.com/v1/assist/recommendations/run"
+          curl -s -X POST "https://previta-api.onrender.com/v1/notify/telegram/run?max_send=3"
