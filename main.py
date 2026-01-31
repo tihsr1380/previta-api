@@ -1168,23 +1168,27 @@ def run_recommendations(minutes_back: int = 180):
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT
-                s.cod_atendimento,
-                s.snapshot_ts,
-                s.state,
-                t.trend_state,
-                s.spo2,
-                s.fr,
-                s.fc,
-                s.pas,
-                s.uso_o2
-            FROM public.clinical_state s
-            LEFT JOIN public.clinical_trends t
-              ON t.cod_atendimento = s.cod_atendimento
-             AND t.snapshot_ts = s.snapshot_ts
-            WHERE s.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
-            ORDER BY s.snapshot_ts DESC;
-        """, (minutes_back,))
+    SELECT
+        s.cod_atendimento,
+        s.snapshot_ts,
+        s.state,
+        t.trend_state,
+        v.spo2,
+        v.fr,
+        v.fc,
+        v.pas,
+        v.uso_o2
+    FROM public.clinical_state s
+    LEFT JOIN public.clinical_trends t
+      ON t.cod_atendimento = s.cod_atendimento
+     AND t.snapshot_ts = s.snapshot_ts
+    LEFT JOIN public.vitals_snapshot v
+      ON v.cod_atendimento = s.cod_atendimento
+     AND v.snapshot_ts = s.snapshot_ts
+    WHERE s.snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
+    ORDER BY s.snapshot_ts DESC;
+""", (minutes_back,))
+
 
         rows = cur.fetchall()
         inserted = 0
@@ -1248,6 +1252,7 @@ def run_recommendations(minutes_back: int = 180):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
