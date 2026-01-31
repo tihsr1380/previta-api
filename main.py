@@ -1824,8 +1824,8 @@ from fastapi import APIRouter, Header, HTTPException
 from typing import Optional, List, Dict, Any
 import os
 import requests
-import psycopg2
-import psycopg2.extras
+import psycopg
+import psycopg.extras
 
 router = APIRouter()
 
@@ -1837,7 +1837,7 @@ API_KEY = os.environ.get("API_KEY")                    # sua chave interna (X-AP
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("Missing env var: DATABASE_URL")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg.connect(DATABASE_URL, cursor_factory=psycopg.extras.RealDictCursor)
 
 def telegram_send(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1925,6 +1925,7 @@ def notify_telegram_run(
 
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
 
 
 
