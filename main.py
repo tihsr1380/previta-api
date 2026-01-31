@@ -454,4 +454,199 @@ def _recommendations(level: str, flags: List[str], trend: str) -> str:
 
     return "\n".join(base)
 
+# ============================================================
+# PIPELINE - EXECUÇÃO (raw -> snapshot -> state/trend -> recommendations -> alerts)
+# ============================================================
+
+def _fetch_latest_raw(cur, cod_atendimento: int) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT *
+        FROM public.vitals_raw
+        WHERE cod_atendimento = %s
+        ORDER BY event_ts DESC
+        LIMIT 1;
+        """,
+        (cod_atendimento,),
+    )
+    return cur.fetchone()
+
+def _fetch_prev_snapshot(cur, cod_atendimento: int, before_ts: datetime) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT *
+        FROM public.vitals_snapshot
+        WHERE cod_atendimento = %s
+          AND snapshot_ts < %s
+        ORDER BY snapshot_ts DESC
+        LIMIT 1;
+        """,
+        (cod_atendimento, before_ts),
+    )
+    return cur.fetchone()
+
+def _upsert_snapshot(cur, vraw: Dict[str, Any]) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.vitals_snapshot
+          (snapshot_ts, cod_atendimento, id_ricadpac, temp, pas, pad, fc, fr, spo2, dor,
+           uso_o2, nivel_consciencia, profissional, created_at, updated_at)
+        VALUES
+          (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+           %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          id_ricadpac = EXCLUDED.id_ricadpac,
+          temp = EXCLUDED.temp,
+          pas  = EXCLUDED.pas,
+          pad  = EXCLUDED.pad,
+          fc   = EXCLUDED.fc,
+          fr   = EXCLUDED.fr,
+          spo2 = EXCLUDED.spo2,
+          dor  = EXCLUDED.dor,
+          uso_o2 = EXCLUDED.uso_o2,
+          nivel_consciencia = EXCLUDED.nivel_consciencia,
+          profissional = EXCLUDED.profissional,
+          updated_at = CURRENT_TIMESTAMP;
+        """,
+        (
+            vraw["event_ts"],
+            vraw["cod_atendimento"],
+            vraw.get("id_ricadpac"),
+            vraw.get("temp"),
+            vraw.get("pas"),
+            vraw.get("pad"),
+            vraw.get("fc"),
+            vraw.get("fr"),
+            vraw.get("spo2"),
+            vraw.get("dor"),
+            vraw.get("uso_o2"),
+            vraw.get("nivel_consciencia"),
+            vraw.get("profissional"),
+        ),
+    )
+
+def _insert_or_update_state(cur, cod_atendimento: int, snapshot_ts: datetime, level: str, score: int) -> None:
+    # Ajuste de nomes conforme sua tabela (se tiver campos diferentes, eu te adapto em 1 min)
+    cur.execute(
+        """
+        INSERT INTO public.clinical_state
+          (cod_atendimento, snapshot_ts, state_level, score, created_at, updated_at)
+        VALUES
+          (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          state_level = EXCLUDED.state_level,
+          score = EXCLUDED.score,
+          updated_at = CURRENT_TIMESTAMP;
+        """,
+        (cod_atendimento, snapshot_ts, level, score),
+    )
+
+def _insert_or_update_trend(cur, cod_atendimento: int, snapshot_ts: datetime, trend: str, delta: Dict[str, Any]) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.clinical_trends
+          (cod_atendimento, snapshot_ts, trend, delta_json, created_at, updated_at)
+        VALUES
+          (%s, %s, %s, %s::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          trend = EXCLUDED.trend,
+          delta_json = EXCLUDED.delta_json,
+          updated_at = CURRENT_TIMESTAMP;
+        """,
+        (cod_atendimento, snapshot_ts, trend, psycopg.types.json.Json(delta)),
+    )
+
+def _insert_or_update_recommendation(
+    cur,
+    cod_atendimento: int,
+    snapshot_ts: datetime,
+    level: str,
+    syndrome: Optional[str],
+    confidence: Optional[str],
+    actions: str,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.clinical_recommendations
+          (cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions,
+           created_at, updated_at)
+        VALUES
+          (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          recommendation_level = EXCLUDED.recommendation_level,
+          syndrome = EXCLUDED.syndrome,
+          confidence = EXCLUDED.confidence,
+          actions = EXCLUDED.actions,
+          updated_at = CURRENT_TIMESTAMP;
+        """,
+        (cod_atendimento, snapshot_ts, level, syndrome, confidence, actions),
+    )
+
+def _insert_alert_notification(cur, cod_atendimento: int, snapshot_ts: datetime, level: str) -> None:
+    # Só registra alerta para níveis relevantes
+    if level not in ("PRIORIDADE", "IMEDIATO"):
+        return
+    cur.execute(
+        """
+        INSERT INTO public.alert_notifications
+          (cod_atendimento, snapshot_ts, level, channel, status, created_at, updated_at)
+        VALUES
+          (%s, %s, %s, 'TELEGRAM', 'PENDENTE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT (cod_atendimento, snapshot_ts, channel)
+        DO NOTHING;
+        """,
+        (cod_atendimento, snapshot_ts, level),
+    )
+
+def run_pipeline_for_patient(cur, cod_atendimento: int) -> Dict[str, Any]:
+    """
+    Pipeline completa para 1 atendimento:
+      - lê último raw
+      - cria snapshot
+      - compara com snapshot anterior
+      - escreve state/trend/recommendations
+      - registra alert_notification
+    """
+    vraw = _fetch_latest_raw(cur, cod_atendimento)
+    if not vraw:
+        return {"ok": False, "reason": "no raw vitals for cod_atendimento"}
+
+    snapshot_ts = vraw["event_ts"]
+    prev = _fetch_prev_snapshot(cur, cod_atendimento, snapshot_ts)
+
+    # 1) snapshot
+    _upsert_snapshot(cur, vraw)
+
+    # 2) severidade / tendência
+    sev = _severity_from_vitals(vraw)
+    tr = _trend(prev, vraw)
+
+    # 3) recomendação (texto pronto)
+    actions = _recommendations(sev["level"], sev["flags"], tr["trend"])
+
+    # síndrome/confidence (deixe neutro por enquanto; você pode plugar sua IA depois)
+    syndrome = "Deterioração clínica (triagem assistencial)" if sev["level"] in ("PRIORIDADE", "IMEDIATO") else None
+    confidence = "ALTA" if sev["score"] >= 8 else ("MEDIA" if sev["score"] >= 4 else "BAIXA")
+
+    # 4) grava tabelas
+    _insert_or_update_state(cur, cod_atendimento, snapshot_ts, sev["level"], sev["score"])
+    _insert_or_update_trend(cur, cod_atendimento, snapshot_ts, tr["trend"], tr["delta"])
+    _insert_or_update_recommendation(cur, cod_atendimento, snapshot_ts, sev["level"], syndrome, confidence, actions)
+    _insert_alert_notification(cur, cod_atendimento, snapshot_ts, sev["level"])
+
+    return {
+        "ok": True,
+        "cod_atendimento": cod_atendimento,
+        "snapshot_ts": str(snapshot_ts),
+        "level": sev["level"],
+        "trend": tr["trend"],
+        "score": sev["score"],
+        "flags": sev["flags"],
+    }
+
+
 
