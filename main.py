@@ -1040,7 +1040,11 @@ def run_recommendations(minutes_back: int = 180, limit: int = 1000):
             LEFT JOIN public.vitals_snapshot v
               ON v.cod_atendimento = s.cod_atendimento
              AND v.snapshot_ts = s.snapshot_ts
-            WHERE s.snapshot_ts >= (%s - (%s || ' minutes')::interval)
+            WHERE s.snapshot_ts >= (
+    (SELECT MAX(snapshot_ts) FROM public.vitals_snapshot)
+    - (%s || ' minutes')::interval
+)
+
             ORDER BY s.snapshot_ts DESC
             LIMIT %s;
         """, (last_snapshot, minutes_back, limit))
@@ -1307,6 +1311,7 @@ def update_recommendation(rec_id: int, payload: RecUpdateIn):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
