@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 # ============================================================
 # APP
 # ============================================================
-app = FastAPI(title="PREVITA API", version="1.0.1")
+app = FastAPI(title="PREVITA API", version="1.0.99")
+
 
 
 # ============================================================
@@ -659,6 +660,7 @@ def run_pipeline_for_patient(cur, cod_atendimento: int) -> Dict[str, Any]:
         "score": sev["score"],
         "flags": sev["flags"],
     }
+
 
 
 
