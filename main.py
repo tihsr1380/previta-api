@@ -1530,27 +1530,28 @@ async def notify_telegram_run(
         # - PRIORIDADE → só se ainda não foi notificado
         cur.execute("""
             SELECT
-              cod_atendimento,
-              snapshot_ts,
-              recommendation_level,
-              syndrome,
-              confidence,
-              actions
-            FROM public.clinical_recommendations
-            WHERE
-              snapshot_ts >= (NOW() - (%s || ' minutes')::interval)
-              AND recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
-              AND (
-                recommendation_level = 'IMEDIATO'
-                OR notified_at IS NULL
-              )
-            ORDER BY
-              CASE recommendation_level
-                WHEN 'IMEDIATO' THEN 2
-                ELSE 1
-              END DESC,
-              confidence DESC
-            LIMIT %s;
+  id,
+  cod_atendimento,
+  snapshot_ts,
+  recommendation_level,
+  syndrome,
+  confidence,
+  actions
+FROM public.clinical_recommendations
+WHERE
+  recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+  AND (
+    recommendation_level = 'IMEDIATO'
+    OR notified_at IS NULL
+  )
+ORDER BY
+  CASE recommendation_level
+    WHEN 'IMEDIATO' THEN 2
+    ELSE 1
+  END DESC,
+  snapshot_ts DESC
+LIMIT %s;
+
         """, (minutes_back, max_send))
 
         rows = cur.fetchall()
@@ -1571,15 +1572,15 @@ async def notify_telegram_run(
 
             # ⚠️ Só marca notified_at se NÃO for IMEDIATO
             cur.execute("""
-                UPDATE public.clinical_recommendations
-                SET notified_at = CASE
-                  WHEN recommendation_level != 'IMEDIATO'
-                  THEN CURRENT_TIMESTAMP
-                  ELSE notified_at
-                END
-                WHERE cod_atendimento = %s
-                  AND snapshot_ts = %s;
-            """, (cod_atendimento, snapshot_ts))
+               UPDATE public.clinical_recommendations
+SET
+  notified_at = CASE
+    WHEN recommendation_level = 'PRIORIDADE'
+    THEN CURRENT_TIMESTAMP
+    ELSE notified_at
+  END,
+  updated_at = CURRENT_TIMESTAMP
+WHERE id = %s;
 
             sent += 1
 
@@ -1595,6 +1596,7 @@ async def notify_telegram_run(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
