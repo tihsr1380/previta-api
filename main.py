@@ -530,6 +530,50 @@ with conn.cursor() as cur:
     # ... seu INSERT vitals_raw ...
     pipe = run_pipeline_for_patient(cur, v.cod_atendimento)
 conn.commit()
+# Após pipe:
+# Se for IMEDIATO, envia já (sem esperar 17 min)
+if pipe.get("created_recommendation") and pipe.get("recommendation_level") == "IMEDIATO":
+    # carrega a recomendação recém criada
+    with get_conn() as conn2:
+        with conn2.cursor() as cur2:
+            cur2.execute("""
+                SELECT id, cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions
+                FROM public.clinical_recommendations
+                WHERE cod_atendimento=%s AND snapshot_ts=%s
+                LIMIT 1;
+            """, (v.cod_atendimento, pipe["snapshot_ts"]))
+            r = cur2.fetchone()
+
+    if r:
+        msg = (
+            f"🚨 <b>PREVITA ALERTA {r['recommendation_level']}</b>\n"
+            f"🧾 <b>Atendimento:</b> {r['cod_atendimento']}\n"
+            f"🕒 <b>Snapshot:</b> {r['snapshot_ts']}\n"
+            f"🧠 <b>Síndrome:</b> {(r['syndrome'] or '-')}\n"
+            f"📌 <b>Confiança:</b> {(r['confidence'] or '-')}\n\n"
+            f"✅ <b>Ações:</b>\n{(r['actions'] or '').strip()[:3500]}"
+        )
+
+        tg = await send_telegram_message(msg)
+
+        # registra auditoria do envio
+        with get_conn() as conn3:
+            with conn3.cursor() as cur3:
+                cur3.execute("""
+                    INSERT INTO public.alert_notifications
+                      (cod_atendimento, snapshot_ts, channel, sent_at, status, response)
+                    VALUES
+                      (%s, %s, %s, NOW(), %s, %s)
+                    ON CONFLICT (cod_atendimento, snapshot_ts, channel)
+                    DO UPDATE SET sent_at=EXCLUDED.sent_at, status=EXCLUDED.status, response=EXCLUDED.response;
+                """, (
+                    r["cod_atendimento"],
+                    _to_aware_utc(r["snapshot_ts"]),  # alert_notifications = timestamptz
+                    "telegram",
+                    "SENT",
+                    str(tg)[:4000]
+                ))
+            conn3.commit()
 
 return {
   "ok": True,
@@ -1012,6 +1056,7 @@ def pipeline_run(cod_atendimento: int):
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
