@@ -186,12 +186,13 @@ def ingest_vital(v: VitalIn):
 
             conn.commit()
 
-        return {
-            "ok": True,
-            "message": "vital registrado + pipeline executada",
-            "cod_atendimento": v.cod_atendimento,
-            "pipeline": pipe,
-        }
+     return {
+  "ok": True,
+  "message": "vital registrado + pipeline executada",
+  "cod_atendimento": v.cod_atendimento,
+  "pipeline": pipe
+}
+
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -671,6 +672,7 @@ def pipeline_run(cod_atendimento: int):
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
