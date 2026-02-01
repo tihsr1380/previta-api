@@ -661,6 +661,17 @@ def run_pipeline_for_patient(cur, cod_atendimento: int) -> Dict[str, Any]:
         "flags": sev["flags"],
     }
 
+@app.post("/v1/pipeline/run")
+def pipeline_run(cod_atendimento: int):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                out = run_pipeline_for_patient(cur, cod_atendimento)
+            conn.commit()
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
