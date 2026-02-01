@@ -79,6 +79,335 @@ def get_last_snapshot_ts(cur) -> Optional[datetime]:
     return row["mx"] if row and row["mx"] else None
 
 
+from datetime import timezone
+
+def _to_aware_utc(dt: datetime) -> datetime:
+    # garante timezone UTC para alert_notifications (timestamptz)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _compute_state_and_score(v: Dict[str, Any]) -> tuple[str, int, str, List[str]]:
+    """
+    Retorna: (state, score, reason, flags)
+    Score 0-100. Flags listam os gatilhos críticos.
+    """
+    flags = []
+    score = 0
+    reasons = []
+
+    temp = v.get("temp")
+    pas = v.get("pas")
+    pad = v.get("pad")
+    fc  = v.get("fc")
+    fr  = v.get("fr")
+    spo2 = v.get("spo2")
+    dor = v.get("dor")
+    uso_o2 = (v.get("uso_o2") or "").strip().lower()
+    consc = (v.get("nivel_consciencia") or "").strip().lower()
+
+    # Oxigenação
+    if spo2 is not None:
+        if spo2 < 90:
+            score += 40; flags.append("SpO2<90"); reasons.append("Hipoxemia importante (SpO2 < 90).")
+        elif spo2 < 92:
+            score += 25; flags.append("SpO2<92"); reasons.append("Hipoxemia (SpO2 < 92).")
+        elif spo2 < 95:
+            score += 10; reasons.append("SpO2 limítrofe (<95).")
+
+    if uso_o2 in ("sim", "s", "yes", "y", "true", "1"):
+        score += 8
+        reasons.append("Em uso de O2 suplementar.")
+
+    # Pressão
+    if pas is not None:
+        if pas < 90:
+            score += 35; flags.append("PAS<90"); reasons.append("Hipotensão (PAS < 90).")
+        elif pas < 100:
+            score += 15; reasons.append("PAS limítrofe (<100).")
+        elif pas >= 180:
+            score += 20; flags.append("PAS>=180"); reasons.append("Crise hipertensiva (PAS >= 180).")
+
+    # FC
+    if fc is not None:
+        if fc >= 130:
+            score += 25; flags.append("FC>=130"); reasons.append("Taquicardia importante (FC >= 130).")
+        elif fc >= 110:
+            score += 12; reasons.append("Taquicardia (FC >= 110).")
+        elif fc < 50:
+            score += 20; flags.append("FC<50"); reasons.append("Bradicardia (FC < 50).")
+
+    # FR
+    if fr is not None:
+        if fr >= 30:
+            score += 25; flags.append("FR>=30"); reasons.append("Taquipneia importante (FR >= 30).")
+        elif fr >= 22:
+            score += 12; reasons.append("Taquipneia (FR >= 22).")
+        elif fr < 10:
+            score += 20; flags.append("FR<10"); reasons.append("Bradipneia (FR < 10).")
+
+    # Temperatura
+    if temp is not None:
+        if temp >= 39:
+            score += 15; reasons.append("Febre alta (>=39).")
+        elif temp >= 38:
+            score += 10; reasons.append("Febre (>=38).")
+        elif temp < 35:
+            score += 20; flags.append("T<35"); reasons.append("Hipotermia (<35).")
+
+    # Dor
+    if dor is not None:
+        if dor >= 7:
+            score += 8; reasons.append("Dor intensa (>=7).")
+        elif dor >= 4:
+            score += 4; reasons.append("Dor moderada (>=4).")
+
+    # Consciência (se você padronizar valores depois, melhora)
+    if consc:
+        if "alerta" not in consc and consc not in ("a", "alerta"):
+            score += 15
+            flags.append("Consciência alterada")
+            reasons.append(f"Nível de consciência alterado ({consc}).")
+
+    # Normaliza score e estado
+    score = max(0, min(100, score))
+    if score >= 55:
+        state = "CRITICO"
+    elif score >= 25:
+        state = "ATENCAO"
+    else:
+        state = "ESTAVEL"
+
+    reason = " ".join(reasons) if reasons else "Sem alterações relevantes nos vitais."
+    return state, score, reason, flags
+
+
+def _compute_trend(prev_score: Optional[int], curr_score: int) -> tuple[str, int, str]:
+    if prev_score is None:
+        return "SEM_BASE", 0, "Primeiro registro do paciente (sem comparação)."
+    delta = curr_score - prev_score
+    if delta >= 15:
+        return "PIORA", delta, f"Piora significativa (+{delta} pontos)."
+    if delta >= 5:
+        return "PIORA_LEVE", delta, f"Piora leve (+{delta} pontos)."
+    if delta <= -15:
+        return "MELHORA", delta, f"Melhora significativa ({delta} pontos)."
+    if delta <= -5:
+        return "MELHORA_LEVE", delta, f"Melhora leve ({delta} pontos)."
+    return "ESTAVEL", delta, f"Sem mudança relevante ({delta} pontos)."
+
+
+def _recommendation_from(state: str, trend_state: str, flags: List[str]) -> tuple[str, str, str, int, str]:
+    """
+    Retorna:
+      (recommendation_level, recommendation_text, syndrome, confidence_int, actions_text)
+    """
+    syndrome = "Deterioração clínica (rule-based)"
+    confidence = 75
+
+    # IMEDIATO quando crítico OU piora significativa com gatilho importante
+    if state == "CRITICO" or ("PIORA" in trend_state and any(f in flags for f in ("SpO2<90","PAS<90","FR>=30","FC>=130","Consciência alterada"))):
+        level = "IMEDIATO"
+        recommendation = "Risco alto de deterioração clínica. Requer avaliação imediata."
+        actions = (
+            "1) Avaliar paciente imediatamente (ABCDE).\n"
+            "2) Confirmar sinais vitais e qualidade do sensor.\n"
+            "3) Checar via aérea/respiração: oferta de O2 conforme protocolo, ausculta, trabalho respiratório.\n"
+            "4) Circulação: PA, perfusão, acesso venoso, considerar fluidos conforme cenário clínico.\n"
+            "5) Reavaliar em 5–10 min ou antes se piora.\n"
+            "6) Acionar médico responsável e considerar time de resposta rápida."
+        )
+        confidence = 85
+        return level, recommendation, syndrome, confidence, actions
+
+    # PRIORIDADE quando atenção + piora leve/moderada
+    if state == "ATENCAO" and trend_state in ("PIORA", "PIORA_LEVE"):
+        level = "PRIORIDADE"
+        recommendation = "Sinais de alerta com tendência de piora. Monitorar de perto e intervir precocemente."
+        actions = (
+            "1) Repetir sinais vitais em 15–30 min.\n"
+            "2) Revisar dor, sedação/consciência e necessidade de O2.\n"
+            "3) Garantir hidratação/analgesia conforme prescrição.\n"
+            "4) Se persistir tendência de piora, escalar para avaliação médica."
+        )
+        confidence = 78
+        return level, recommendation, syndrome, confidence, actions
+
+    # Estável: não precisa gerar recomendação “alertável”
+    level = "PRIORIDADE" if state == "ATENCAO" else "PRIORIDADE"
+    recommendation = "Paciente estável no último snapshot. Manter monitorização conforme rotina."
+    actions = "1) Seguir plano assistencial.\n2) Reavaliar conforme periodicidade.\n3) Registrar achados relevantes."
+    confidence = 65
+    return level, recommendation, syndrome, confidence, actions
+
+
+def run_pipeline_for_patient(cur, cod_atendimento: int) -> Dict[str, Any]:
+    """
+    1) cria/atualiza snapshot baseado no último registro de vitals_raw
+    2) calcula clinical_state
+    3) calcula clinical_trends vs snapshot anterior
+    4) cria/atualiza clinical_recommendations
+    Retorna um dict para debug.
+    """
+    # pega o último vital do paciente
+    cur.execute(
+        """
+        SELECT *
+        FROM public.vitals_raw
+        WHERE cod_atendimento = %s
+        ORDER BY event_ts DESC
+        LIMIT 1;
+        """,
+        (cod_atendimento,),
+    )
+    last = cur.fetchone()
+    if not last:
+        return {"ok": False, "reason": "sem vitals_raw"}
+
+    snapshot_ts = last["event_ts"]  # timestamp sem tz no snapshot/trends/state
+    # snapshot (upsert)
+    cur.execute(
+        """
+        INSERT INTO public.vitals_snapshot
+          (cod_atendimento, snapshot_ts, temp, pas, pad, fc, fr, spo2, dor,
+           uso_o2, nivel_consciencia, profissional, id_ricadpac, created_at)
+        VALUES
+          (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          temp=EXCLUDED.temp, pas=EXCLUDED.pas, pad=EXCLUDED.pad,
+          fc=EXCLUDED.fc, fr=EXCLUDED.fr, spo2=EXCLUDED.spo2, dor=EXCLUDED.dor,
+          uso_o2=EXCLUDED.uso_o2, nivel_consciencia=EXCLUDED.nivel_consciencia,
+          profissional=EXCLUDED.profissional, id_ricadpac=EXCLUDED.id_ricadpac;
+        """,
+        (
+            cod_atendimento,
+            snapshot_ts,
+            last.get("temp"),
+            last.get("pas"),
+            last.get("pad"),
+            last.get("fc"),
+            last.get("fr"),
+            last.get("spo2"),
+            last.get("dor"),
+            last.get("uso_o2"),
+            last.get("nivel_consciencia"),
+            last.get("profissional"),
+            last.get("id_ricadpac"),
+        ),
+    )
+
+    # buscar score anterior para trend
+    cur.execute(
+        """
+        SELECT state_score
+        FROM public.clinical_state
+        WHERE cod_atendimento=%s AND snapshot_ts < %s
+        ORDER BY snapshot_ts DESC
+        LIMIT 1;
+        """,
+        (cod_atendimento, snapshot_ts),
+    )
+    prev = cur.fetchone()
+    prev_score = prev["state_score"] if prev else None
+
+    state, state_score, state_reason, flags = _compute_state_and_score(last)
+    trend_state, trend_score, trend_reason = _compute_trend(prev_score, state_score)
+
+    # upsert clinical_state
+    cur.execute(
+        """
+        INSERT INTO public.clinical_state
+          (cod_atendimento, id_ricadpac, snapshot_ts, state, state_score, state_reason, created_at)
+        VALUES
+          (%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          id_ricadpac=EXCLUDED.id_ricadpac,
+          state=EXCLUDED.state,
+          state_score=EXCLUDED.state_score,
+          state_reason=EXCLUDED.state_reason;
+        """,
+        (cod_atendimento, last.get("id_ricadpac"), snapshot_ts, state, state_score, state_reason),
+    )
+
+    # upsert clinical_trends
+    cur.execute(
+        """
+        INSERT INTO public.clinical_trends
+          (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason, created_at)
+        VALUES
+          (%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (cod_atendimento, snapshot_ts)
+        DO UPDATE SET
+          trend_state=EXCLUDED.trend_state,
+          trend_score=EXCLUDED.trend_score,
+          trend_reason=EXCLUDED.trend_reason;
+        """,
+        (cod_atendimento, snapshot_ts, trend_state, trend_score, trend_reason),
+    )
+
+    # recommendation
+    level, reco_text, syndrome, confidence, actions = _recommendation_from(state, trend_state, flags)
+
+    # regra: só cria recomendação alertável quando há risco (ATENCAO+PIORA ou CRITICO)
+    should_create = (state == "CRITICO") or (state == "ATENCAO" and trend_state in ("PIORA","PIORA_LEVE"))
+
+    reco_id = None
+    if should_create:
+        cur.execute(
+            """
+            INSERT INTO public.clinical_recommendations
+              (cod_atendimento, snapshot_ts, state, trend_state, recommendation_level,
+               recommendation, syndrome, actions, confidence, created_at, status, updated_at)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),'NOVO',NOW())
+            ON CONFLICT (cod_atendimento, snapshot_ts)
+            DO UPDATE SET
+              state=EXCLUDED.state,
+              trend_state=EXCLUDED.trend_state,
+              recommendation_level=EXCLUDED.recommendation_level,
+              recommendation=EXCLUDED.recommendation,
+              syndrome=EXCLUDED.syndrome,
+              actions=EXCLUDED.actions,
+              confidence=EXCLUDED.confidence,
+              updated_at=NOW();
+            """,
+            (
+                cod_atendimento,
+                snapshot_ts,
+                state,
+                trend_state,
+                level,
+                reco_text,
+                syndrome,
+                actions,
+                confidence,
+            ),
+        )
+        cur.execute(
+            "SELECT id FROM public.clinical_recommendations WHERE cod_atendimento=%s AND snapshot_ts=%s;",
+            (cod_atendimento, snapshot_ts),
+        )
+        rid = cur.fetchone()
+        reco_id = rid["id"] if rid else None
+
+    return {
+        "ok": True,
+        "cod_atendimento": cod_atendimento,
+        "snapshot_ts": str(snapshot_ts),
+        "state": state,
+        "state_score": state_score,
+        "trend_state": trend_state,
+        "trend_score": trend_score,
+        "flags": flags,
+        "created_recommendation": bool(should_create),
+        "recommendation_level": level if should_create else None,
+        "recommendation_id": reco_id,
+    }
+
+
+
 # ============================================================
 # MODELOS
 # ============================================================
@@ -197,6 +526,17 @@ def ingest_vital(v: VitalIn):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+with conn.cursor() as cur:
+    # ... seu INSERT vitals_raw ...
+    pipe = run_pipeline_for_patient(cur, v.cod_atendimento)
+conn.commit()
+
+return {
+  "ok": True,
+  "message": "vital registrado + pipeline executada",
+  "cod_atendimento": v.cod_atendimento,
+  "pipeline": pipe
+}
 
 
 # ============================================================
@@ -672,6 +1012,7 @@ def pipeline_run(cod_atendimento: int):
         return out
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
