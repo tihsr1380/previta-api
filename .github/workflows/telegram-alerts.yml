@@ -30,3 +30,6 @@ jobs:
             -H "Content-Type: application/json")
           echo "Resposta API:"
           echo "$RESP"
+concurrency: 
+  group: previta-telegram-alerts
+  cancel-in-progress: false
