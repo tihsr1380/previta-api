@@ -1,16 +1,6 @@
 # =========================
-# PREVITA API — MAIN (v3.3.1) — NEON POOLER FIX
+# PREVITA API — MAIN (v3.3.2) — FIX 422 + NEON POOLER OK
 # =========================
-# Fixes:
-# - Remove "options=-c statement_timeout=..." (Neon pooler não suporta startup param)
-# - Aplica statement_timeout via "SET statement_timeout" após conectar
-# - Remove/ignora channel_binding (recomendado remover do DATABASE_URL)
-# - Força IPv4 via hostaddr (Render frequentemente sem rota IPv6)
-# - Aceita payload Power Automate em formatos variados
-# - Normaliza chaves PowerBI + chaves curtas
-# - event_ts robusto (corrige DATA_HORA_LANC_MINUTO zerado)
-# - Upsert MERGE para não perder campos
-# - Responde rápido (background)
 
 import os
 import time
@@ -22,13 +12,13 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Body
 from pydantic import BaseModel, Field, ConfigDict
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="PREVITA API", version="3.3.1")
+app = FastAPI(title="PREVITA API", version="3.3.2")
 
 # =========================
 # ENV
@@ -54,7 +44,7 @@ def send_telegram_message_sync(text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": TELELEGRAM_CHAT_ID if False else TELEGRAM_CHAT_ID,  # mantém simples
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -64,7 +54,7 @@ def send_telegram_message_sync(text: str):
         pass
 
 # =========================
-# DB CONNECT (Render + Neon) — FORÇA IPv4 + evita params problemáticos
+# DB CONNECT — Render + Neon Pooler (IPv4 + sem startup params proibidos)
 # =========================
 def _resolve_ipv4_or_fail(hostname: str) -> str:
     infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
@@ -78,38 +68,29 @@ def _extract_hostname_from_url(db_url: str) -> str:
     after_at = db_url.split("@", 1)[1]
     host_port = after_at.split("/", 1)[0]
 
-    # suporte a [ipv6]:port (não recomendado aqui)
     if host_port.startswith("[") and "]" in host_port:
         return host_port.split("]")[0].lstrip("[")
 
-    # host:port
     if ":" in host_port:
         return host_port.split(":")[0]
     return host_port
 
 def _strip_bad_params(db_url: str) -> str:
-    """
-    Remove parâmetros que atrapalham:
-    - channel_binding=require (recomendado remover)
-    """
+    # remove channel_binding (frequentemente atrapalha)
     if "?" not in db_url:
         return db_url
-
     base, qs = db_url.split("?", 1)
     parts = [p for p in qs.split("&") if p.strip()]
     parts = [p for p in parts if not p.lower().startswith("channel_binding=")]
     return base + "?" + "&".join(parts) if parts else base
 
 def _configure_session(conn: psycopg.Connection):
-    """
-    Neon Pooler não aceita startup param statement_timeout.
-    Então setamos depois que conecta.
-    """
+    # Neon Pooler não aceita startup param "options=-c ..."
+    # então aplicamos timeout via SET depois de conectar
     try:
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = 15000;")  # 15s
     except Exception:
-        # não derruba ingest se esse SET falhar por qualquer motivo
         pass
 
 def get_conn():
@@ -120,7 +101,7 @@ def get_conn():
     host = _extract_hostname_from_url(url)
     ipv4 = _resolve_ipv4_or_fail(host)
 
-    # hostaddr força IPv4, mantendo hostname para TLS/SNI
+    # força IPv4 mantendo hostname para TLS/SNI
     conninfo = f"{url}&hostaddr={ipv4}" if "?" in url else f"{url}?hostaddr={ipv4}"
 
     conn = psycopg.connect(
@@ -132,7 +113,7 @@ def get_conn():
     return conn
 
 # =========================
-# INIT TABLES (com retry)
+# INIT TABLES (retry)
 # =========================
 def ensure_tables_once():
     with get_conn() as conn:
@@ -257,6 +238,7 @@ def _parse_event_ts(d: Dict[str, Any]) -> datetime:
     m = _to_int(_pick(d, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]"))
 
     if dh:
+        # se vier 00:00:00 e temos hora/minuto, reconstrói
         if (dh.hour == 0 and dh.minute == 0) and dl and (h is not None or m is not None):
             return dl.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
         return dh
@@ -298,15 +280,12 @@ def normalize_powerbi_rows(raw_rows: List[Dict[str, Any]]) -> List[VitalRow]:
     return out
 
 # =========================
-# HEALTH
+# HEALTH + DB PING
 # =========================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# =========================
-# DB PING
-# =========================
 @app.get("/v1/db/ping")
 def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
     _check_key(x_api_key)
@@ -358,12 +337,12 @@ def persist_rows_merge(rows: List[VitalRow]) -> int:
     return count
 
 # =========================
-# INGEST — BATCH (aceita vários formatos e responde rápido)
+# INGEST — BATCH (FIX 422: força Body)
 # =========================
 @app.post("/v1/vitals/batch")
 def vitals_batch(
-    payload: Any,
-    background: BackgroundTasks,
+    payload: Any = Body(...),  # <- FIX CRÍTICO: garante que vem do BODY, não da query
+    background: BackgroundTasks = None,
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
@@ -396,5 +375,10 @@ def vitals_batch(
     if not rows:
         return {"ok": True, "queued": 0, "message": "Linhas inválidas / sem campos mínimos"}
 
-    background.add_task(persist_rows_merge, rows)
+    # grava em background para não estourar tempo do Power Automate
+    if background:
+        background.add_task(persist_rows_merge, rows)
+    else:
+        persist_rows_merge(rows)
+
     return {"ok": True, "queued": len(rows), "message": "Processando em background"}
