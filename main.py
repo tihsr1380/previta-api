@@ -1,19 +1,26 @@
 # =========================
-# PREVITA API — MAIN (v3)  ✅ Robust ingest + merge partial rows
+# PREVITA API — MAIN (v3.1) - FAST + SAFE
+# - responde rápido (202) e grava em background
+# - pool + timeouts (não trava no Neon/DB)
+# - upsert com merge (não perde campos)
 # =========================
+
 import os
-from typing import Optional, List, Any, Dict, Tuple, Union
-from datetime import datetime
+from typing import Optional, List, Any, Dict
+from datetime import datetime, date, time
 
 import requests
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
+from psycopg_pool import ConnectionPool
+
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from pydantic import BaseModel, Field, ConfigDict
 
 # =========================
 # APP
 # =========================
-app = FastAPI(title="PREVITA API", version="3.0.0")
+app = FastAPI(title="PREVITA API", version="3.1.0")
 
 # =========================
 # ENV
@@ -24,12 +31,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
 
 # =========================
-# DB
+# DB POOL
 # =========================
-def get_conn():
+POOL: Optional[ConnectionPool] = None
+
+def _raise_if_no_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def get_conn():
+    """
+    Retorna conexão do pool.
+    connect_timeout e statement_timeout garantem que não trava.
+    """
+    global POOL
+    _raise_if_no_db()
+    if POOL is None:
+        raise RuntimeError("DB pool não inicializado")
+    return POOL.connection()
 
 # =========================
 # AUTH
@@ -44,212 +63,125 @@ def _check_key(x_api_key: Optional[str]):
 def send_telegram_message_sync(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
     try:
-        requests.post(url, json=payload, timeout=20)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, json=payload, timeout=10)
     except Exception:
         pass
 
 # =========================
-# TABLES
+# MODELS
 # =========================
-def ensure_tables():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.vitals_events (
-            id BIGSERIAL PRIMARY KEY,
-            event_key TEXT UNIQUE,
-            src_id BIGINT NULL,
-            cod_atendimento INT NOT NULL,
-            id_ricadpac INT NULL,
-            event_ts TIMESTAMP NOT NULL,
-            hora INT NULL,
-            minuto INT NULL,
-            temp DOUBLE PRECISION NULL,
-            pas INT NULL,
-            pad INT NULL,
-            fc INT NULL,
-            fr INT NULL,
-            spo2 INT NULL,
-            dor TEXT NULL,
-            uso_o2 TEXT NULL,
-            nivel_consciencia TEXT NULL,
-            profissional TEXT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
+class VitalRow(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
-        CREATE INDEX IF NOT EXISTS idx_vitals_events_ts
-            ON public.vitals_events (event_ts DESC);
+    cod_atendimento: int
+    id_ricadpac: Optional[int] = None
 
-        CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
-            id BIGSERIAL PRIMARY KEY,
-            cod_atendimento INT NOT NULL,
-            snapshot_ts TIMESTAMP NOT NULL,
-            recommendation_level TEXT NOT NULL,
-            syndrome TEXT NULL,
-            confidence DOUBLE PRECISION NULL,
-            actions TEXT NULL,
-            notified_at TIMESTAMP NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
+    # timestamp do evento (vem do PowerBI)
+    event_ts: datetime
 
-        CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts
-            ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    hora: Optional[int] = None
+    minuto: Optional[int] = None
+    temp: Optional[float] = None
+    pas: Optional[int] = None
+    pad: Optional[int] = None
+    fc: Optional[int] = None
+    fr: Optional[int] = None
+    spo2: Optional[int] = None
 
-@app.on_event("startup")
-def _startup():
-    ensure_tables()
+    dor: Optional[str] = None
+    uso_o2: Optional[str] = None
+    nivel_consciencia: Optional[str] = None
+    profissional: Optional[str] = None
 
-# =========================
-# HELPERS — parsing
-# =========================
-PBI_MAP = {
-    "VW_PREVITA_VITAIS_AGRUPADOS[ID]": "src_id",
-    "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]": "cod_atendimento",
-    "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]": "id_ricadpac",
-    "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]": "data_lanc",
-    "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]": "hora",
-    "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]": "minuto",
-    "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]": "data_hora_lanc_minuto",
-    "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]": "temp",
-    "VW_PREVITA_VITAIS_AGRUPADOS[PAS]": "pas",
-    "VW_PREVITA_VITAIS_AGRUPADOS[PAD]": "pad",
-    "VW_PREVITA_VITAIS_AGRUPADOS[FC]": "fc",
-    "VW_PREVITA_VITAIS_AGRUPADOS[FR]": "fr",
-    "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]": "spo2",
-    "VW_PREVITA_VITAIS_AGRUPADOS[DOR]": "dor",
-    "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]": "uso_o2",
-    "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]": "nivel_consciencia",
-    "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]": "profissional",
-}
-
-def _to_int(v) -> Optional[int]:
-    if v is None:
-        return None
-    try:
-        # PowerBI às vezes manda 21037.00 etc
-        return int(float(v))
-    except Exception:
-        return None
-
-def _to_float(v) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
-
-def _to_str(v) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s != "" else None
-
-def _parse_iso_date(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        # tenta pegar só a data
-        try:
-            return datetime.fromisoformat(s.split("T")[0])
-        except Exception:
-            return None
-
-def normalize_row(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Converte chaves PowerBI (VW_PREVITA...) para chaves canônicas.
-    Se já vier canônico, mantém.
-    """
-    out: Dict[str, Any] = {}
-    for k, v in raw.items():
-        kk = PBI_MAP.get(k, k)
-        out[kk] = v
-    return out
-
-def build_event_ts(n: Dict[str, Any]) -> datetime:
-    """
-    Regra sênior (estável):
-    - event_ts = DATA_LANC (apenas data) + HORA_LANC + MINUTO_LANC
-    - se DATA_LANC não existir, tenta DATA_HORA_LANC_MINUTO
-    """
-    base = _parse_iso_date(_to_str(n.get("data_lanc"))) or _parse_iso_date(_to_str(n.get("data_hora_lanc_minuto")))
-    if not base:
-        raise ValueError("Sem data válida (DATA_LANC/DATA_HORA_LANC_MINUTO)")
-
-    hora = _to_int(n.get("hora")) or 0
-    minuto = _to_int(n.get("minuto")) or 0
-    return datetime(base.year, base.month, base.day, hora, minuto, 0)
-
-def make_event_key(n: Dict[str, Any], event_ts: datetime) -> str:
-    """
-    Chave idempotente para MESCLAR linhas parciais do mesmo minuto.
-    Inclui src_id (ID do dataset) quando disponível.
-    """
-    cod = _to_int(n.get("cod_atendimento"))
-    if cod is None:
-        raise ValueError("cod_atendimento ausente")
-    ric = _to_int(n.get("id_ricadpac"))
-    sid = _to_int(n.get("src_id"))
-    # chave por minuto + id + atendimento/paciente
-    return f"{cod}|{ric or 0}|{sid or 0}|{event_ts.strftime('%Y-%m-%d %H:%M')}"
-
-def extract_rows_from_any_payload(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Aceita:
-      A) {"rows":[...]}
-      B) [...]
-      C) resposta PowerBI: {"results":[{"tables":[{"rows":[...]}]}]}
-    """
-    if payload is None:
-        return []
-
-    # B) lista direta
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if not isinstance(payload, dict):
-        return []
-
-    # A) {"rows":[...]}
-    if isinstance(payload.get("rows"), list):
-        return [x for x in payload["rows"] if isinstance(x, dict)]
-
-    # C) resposta PowerBI
-    results = payload.get("results")
-    if isinstance(results, list) and results:
-        try:
-            tables = results[0].get("tables")
-            if isinstance(tables, list) and tables:
-                rows = tables[0].get("rows")
-                if isinstance(rows, list):
-                    return [x for x in rows if isinstance(x, dict)]
-        except Exception:
-            pass
-
-    return []
+class VitalBatch(BaseModel):
+    rows: List[VitalRow] = Field(default_factory=list)
 
 # =========================
 # HEALTH
 # =========================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok"}
+
+# =========================
+# INIT TABLES
+# =========================
+def ensure_tables():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.vitals_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_key TEXT UNIQUE,
+                    cod_atendimento INT NOT NULL,
+                    id_ricadpac INT NULL,
+                    event_ts TIMESTAMP NOT NULL,
+                    hora INT NULL,
+                    minuto INT NULL,
+                    temp DOUBLE PRECISION NULL,
+                    pas INT NULL,
+                    pad INT NULL,
+                    fc INT NULL,
+                    fr INT NULL,
+                    spo2 INT NULL,
+                    dor TEXT NULL,
+                    uso_o2 TEXT NULL,
+                    nivel_consciencia TEXT NULL,
+                    profissional TEXT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_vitals_events_ts
+                    ON public.vitals_events (event_ts DESC);
+
+                CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
+                    id BIGSERIAL PRIMARY KEY,
+                    cod_atendimento INT NOT NULL,
+                    snapshot_ts TIMESTAMP NOT NULL,
+                    recommendation_level TEXT NOT NULL, -- IMEDIATO | PRIORIDADE | OK
+                    syndrome TEXT NULL,
+                    confidence DOUBLE PRECISION NULL,
+                    actions TEXT NULL,
+                    notified_at TIMESTAMP NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts
+                    ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);
+            """)
+        conn.commit()
+
+@app.on_event("startup")
+def _startup():
+    global POOL
+    _raise_if_no_db()
+
+    # Pool com timeouts para não travar:
+    # - connect_timeout: não fica pendurado tentando conectar
+    # - statement_timeout: query não fica pendurada
+    # (Neon pode dar "cold start", isso evita travas longas)
+    POOL = ConnectionPool(
+        conninfo=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        kwargs={
+            "row_factory": dict_row,
+            "connect_timeout": 8,  # segundos
+            "options": "-c statement_timeout=12000"  # 12s por statement
+        }
+    )
+
+    ensure_tables()
 
 # =========================
 # LAST EVENT TS
@@ -257,17 +189,15 @@ def health():
 @app.get("/v1/vitals/last_event_ts")
 def last_event_ts(x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY")):
     _check_key(x_api_key)
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT MAX(event_ts) AS last_ts FROM public.vitals_events;")
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    last_ts = row["last_ts"]
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(event_ts) AS last_ts FROM public.vitals_events;")
+            row = cur.fetchone()
+    last_ts = row["last_ts"] if row else None
     return {"last_event_ts": last_ts.isoformat() if last_ts else "1970-01-01T00:00:00"}
 
 # =========================
-# RECOMMENDATIONS (same idea)
+# RECOMMENDATIONS
 # =========================
 def compute_recommendations_for_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     recs: List[Dict[str, Any]] = []
@@ -280,13 +210,13 @@ def compute_recommendations_for_rows(rows: List[Dict[str, Any]]) -> List[Dict[st
         spo2 = r.get("spo2")
         pas = r.get("pas")
 
-        if isinstance(spo2, (int, float)) and spo2 < 92:
+        if spo2 is not None and spo2 < 92:
             level = "PRIORIDADE"
             syndrome = "Hipoxemia"
             confidence = 0.7
             actions = "Reavaliar oximetria, verificar O2, checar desconforto respiratório e acionar protocolo."
 
-        if isinstance(pas, (int, float)) and pas < 90:
+        if pas is not None and pas < 90:
             level = "IMEDIATO"
             syndrome = "Hipotensão"
             confidence = 0.8
@@ -307,168 +237,211 @@ def persist_recommendations_and_notify(recs: List[Dict[str, Any]]):
     if not recs:
         return
 
-    conn = get_conn()
-    cur = conn.cursor()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for rec in recs:
+                cur.execute("""
+                    INSERT INTO public.clinical_recommendations
+                        (cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP);
+                """, (
+                    rec["cod_atendimento"],
+                    rec["snapshot_ts"],
+                    rec["recommendation_level"],
+                    rec.get("syndrome"),
+                    rec.get("confidence"),
+                    rec.get("actions"),
+                ))
 
-    for rec in recs:
-        cur.execute("""
-            INSERT INTO public.clinical_recommendations
-                (cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP);
-        """, (
-            rec["cod_atendimento"],
-            rec["snapshot_ts"],
-            rec["recommendation_level"],
-            rec.get("syndrome"),
-            rec.get("confidence"),
-            rec.get("actions"),
-        ))
-
-        if rec["recommendation_level"] == "IMEDIATO":
-            msg = (
-                f"🚨 <b>PREVITA – ALERTA IMEDIATO</b>\n\n"
-                f"🧾 <b>Atendimento:</b> {rec['cod_atendimento']}\n"
-                f"🕒 <b>Snapshot:</b> {rec['snapshot_ts']}\n"
-                f"🧠 <b>Síndrome:</b> {rec.get('syndrome') or '-'}\n"
-                f"✅ <b>Ações:</b>\n{(rec.get('actions') or '-').strip()[:3500]}"
-            )
-            send_telegram_message_sync(msg)
-
-    conn.commit()
-    cur.close()
-    conn.close()
+                if rec["recommendation_level"] == "IMEDIATO":
+                    msg = (
+                        f"🚨 <b>PREVITA – ALERTA IMEDIATO</b>\n\n"
+                        f"🧾 <b>Atendimento:</b> {rec['cod_atendimento']}\n"
+                        f"🕒 <b>Snapshot:</b> {rec['snapshot_ts']}\n"
+                        f"🧠 <b>Síndrome:</b> {rec.get('syndrome') or '-'}\n"
+                        f"✅ <b>Ações:</b>\n{(rec.get('actions') or '-').strip()[:3500]}"
+                    )
+                    send_telegram_message_sync(msg)
+        conn.commit()
 
 # =========================
-# INGEST — BATCH (robust)
+# BACKGROUND INSERT (FAST)
+# =========================
+def _persist_vitals_batch(rows: List[VitalRow]) -> Dict[str, int]:
+    inserted = 0
+    updated = 0
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
+
+                # Upsert com MERGE:
+                # se chegar depois com campos que antes eram NULL, ele preenche.
+                cur.execute("""
+                    INSERT INTO public.vitals_events (
+                        event_key, cod_atendimento, id_ricadpac, event_ts,
+                        hora, minuto, temp, pas, pad, fc, fr, spo2,
+                        dor, uso_o2, nivel_consciencia, profissional,
+                        updated_at
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+                    ON CONFLICT (event_key) DO UPDATE SET
+                        id_ricadpac        = COALESCE(EXCLUDED.id_ricadpac, vitals_events.id_ricadpac),
+                        hora              = COALESCE(EXCLUDED.hora, vitals_events.hora),
+                        minuto            = COALESCE(EXCLUDED.minuto, vitals_events.minuto),
+                        temp              = COALESCE(EXCLUDED.temp, vitals_events.temp),
+                        pas               = COALESCE(EXCLUDED.pas, vitals_events.pas),
+                        pad               = COALESCE(EXCLUDED.pad, vitals_events.pad),
+                        fc                = COALESCE(EXCLUDED.fc, vitals_events.fc),
+                        fr                = COALESCE(EXCLUDED.fr, vitals_events.fr),
+                        spo2              = COALESCE(EXCLUDED.spo2, vitals_events.spo2),
+                        dor               = COALESCE(EXCLUDED.dor, vitals_events.dor),
+                        uso_o2            = COALESCE(EXCLUDED.uso_o2, vitals_events.uso_o2),
+                        nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_events.nivel_consciencia),
+                        profissional      = COALESCE(EXCLUDED.profissional, vitals_events.profissional),
+                        updated_at        = CURRENT_TIMESTAMP
+                    WHERE
+                        EXCLUDED.id_ricadpac IS NOT NULL OR
+                        EXCLUDED.hora IS NOT NULL OR
+                        EXCLUDED.minuto IS NOT NULL OR
+                        EXCLUDED.temp IS NOT NULL OR
+                        EXCLUDED.pas IS NOT NULL OR
+                        EXCLUDED.pad IS NOT NULL OR
+                        EXCLUDED.fc IS NOT NULL OR
+                        EXCLUDED.fr IS NOT NULL OR
+                        EXCLUDED.spo2 IS NOT NULL OR
+                        EXCLUDED.dor IS NOT NULL OR
+                        EXCLUDED.uso_o2 IS NOT NULL OR
+                        EXCLUDED.nivel_consciencia IS NOT NULL OR
+                        EXCLUDED.profissional IS NOT NULL;
+                """, (
+                    event_key, r.cod_atendimento, r.id_ricadpac, r.event_ts,
+                    r.hora, r.minuto, r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
+                    r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
+                ))
+
+                # rowcount pode ser 1 em insert, e 1 em update (depende do driver)
+                # vamos inferir pelo retorno do status message:
+                status = (cur.statusmessage or "").upper()
+                if status.startswith("INSERT"):
+                    inserted += 1
+                elif status.startswith("UPDATE"):
+                    updated += 1
+
+        conn.commit()
+
+    return {"inserted": inserted, "updated": updated}
+
+# =========================
+# INGEST — BATCH (RESPONDE RÁPIDO)
 # =========================
 @app.post("/v1/vitals/batch")
-async def vitals_batch(
-    request: Request,
+def vitals_batch(
+    payload: VitalBatch,
     background: BackgroundTasks,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
 
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Body inválido (JSON esperado)")
+    if not payload.rows:
+        return {"ok": True, "queued": 0, "message": "Sem linhas"}
 
-    raw_rows = extract_rows_from_any_payload(payload)
-    if not raw_rows:
-        return {"ok": True, "inserted": 0, "updated": 0, "message": "Sem linhas"}
+    # RESPONDE IMEDIATO pro Power Automate não estourar tempo
+    # e processa DB em background
+    rows = payload.rows
 
-    # normaliza + monta event_ts + tipagem
-    normalized: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    for rr in raw_rows:
+    def _job():
         try:
-            n = normalize_row(rr)
-
-            cod = _to_int(n.get("cod_atendimento"))
-            if cod is None:
-                raise ValueError("cod_atendimento ausente")
-
-            event_ts = build_event_ts(n)
-            event_key = make_event_key(n, event_ts)
-
-            normalized.append({
-                "event_key": event_key,
-                "src_id": _to_int(n.get("src_id")),
-                "cod_atendimento": cod,
-                "id_ricadpac": _to_int(n.get("id_ricadpac")),
-                "event_ts": event_ts,
-                "hora": _to_int(n.get("hora")),
-                "minuto": _to_int(n.get("minuto")),
-                "temp": _to_float(n.get("temp")),
-                "pas": _to_int(n.get("pas")),
-                "pad": _to_int(n.get("pad")),
-                "fc": _to_int(n.get("fc")),
-                "fr": _to_int(n.get("fr")),
-                "spo2": _to_int(n.get("spo2")),
-                "dor": _to_str(n.get("dor")),
-                "uso_o2": _to_str(n.get("uso_o2")),
-                "nivel_consciencia": _to_str(n.get("nivel_consciencia")),
-                "profissional": _to_str(n.get("profissional")),
-            })
+            stats = _persist_vitals_batch(rows)
+            # recomendações só depois de persistir
+            rec_rows = [
+                {
+                    "cod_atendimento": r.cod_atendimento,
+                    "event_ts": r.event_ts,
+                    "pas": r.pas,
+                    "spo2": r.spo2
+                }
+                for r in rows
+            ]
+            recs = compute_recommendations_for_rows(rec_rows)
+            persist_recommendations_and_notify(recs)
+            print(f"[INGEST] ok stats={stats} recs={len(recs)}")
         except Exception as e:
-            errors.append(str(e))
+            print(f"[INGEST] ERROR: {e}")
 
-    if not normalized:
-        raise HTTPException(status_code=422, detail={"msg": "Nenhuma linha válida", "errors": errors[:20]})
+    background.add_task(_job)
 
-    # UPSERT que MESCLA campos parciais (não apaga com NULL)
-    conn = get_conn()
-    cur = conn.cursor()
+    return {"ok": True, "queued": len(rows), "message": "Processando em background"}
 
-    inserted = 0
-    updated = 0
+# =========================
+# NOTIFY TELEGRAM — PRODUÇÃO
+# =========================
+@app.post("/v1/notify/telegram/run")
+def notify_telegram_run(
+    minutes_back: int = 180,
+    max_send: int = 10,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
+):
+    _check_key(x_api_key)
 
-    upsert_sql = """
-        INSERT INTO public.vitals_events (
-            event_key, src_id, cod_atendimento, id_ricadpac, event_ts,
-            hora, minuto, temp, pas, pad, fc, fr, spo2,
-            dor, uso_o2, nivel_consciencia, profissional, updated_at
-        )
-        VALUES (
-            %(event_key)s, %(src_id)s, %(cod_atendimento)s, %(id_ricadpac)s, %(event_ts)s,
-            %(hora)s, %(minuto)s, %(temp)s, %(pas)s, %(pad)s, %(fc)s, %(fr)s, %(spo2)s,
-            %(dor)s, %(uso_o2)s, %(nivel_consciencia)s, %(profissional)s, CURRENT_TIMESTAMP
-        )
-        ON CONFLICT (event_key) DO UPDATE SET
-            src_id = COALESCE(EXCLUDED.src_id, public.vitals_events.src_id),
-            id_ricadpac = COALESCE(EXCLUDED.id_ricadpac, public.vitals_events.id_ricadpac),
-            event_ts = COALESCE(EXCLUDED.event_ts, public.vitals_events.event_ts),
-            hora = COALESCE(EXCLUDED.hora, public.vitals_events.hora),
-            minuto = COALESCE(EXCLUDED.minuto, public.vitals_events.minuto),
-            temp = COALESCE(EXCLUDED.temp, public.vitals_events.temp),
-            pas = COALESCE(EXCLUDED.pas, public.vitals_events.pas),
-            pad = COALESCE(EXCLUDED.pad, public.vitals_events.pad),
-            fc = COALESCE(EXCLUDED.fc, public.vitals_events.fc),
-            fr = COALESCE(EXCLUDED.fr, public.vitals_events.fr),
-            spo2 = COALESCE(EXCLUDED.spo2, public.vitals_events.spo2),
-            dor = COALESCE(EXCLUDED.dor, public.vitals_events.dor),
-            uso_o2 = COALESCE(EXCLUDED.uso_o2, public.vitals_events.uso_o2),
-            nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, public.vitals_events.nivel_consciencia),
-            profissional = COALESCE(EXCLUDED.profissional, public.vitals_events.profissional),
-            updated_at = CURRENT_TIMESTAMP
-        RETURNING (xmax = 0) AS inserted_flag;
-    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        id,
+                        cod_atendimento,
+                        snapshot_ts,
+                        recommendation_level,
+                        syndrome,
+                        confidence,
+                        actions
+                    FROM public.clinical_recommendations
+                    WHERE
+                        recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
+                        AND (
+                            recommendation_level = 'IMEDIATO'
+                            OR notified_at IS NULL
+                        )
+                    ORDER BY
+                        CASE recommendation_level
+                            WHEN 'IMEDIATO' THEN 2
+                            ELSE 1
+                        END DESC,
+                        snapshot_ts DESC
+                    LIMIT %s;
+                """, (max_send,))
+                rows = cur.fetchall()
 
-    for row in normalized:
-        cur.execute(upsert_sql, row)
-        ret = cur.fetchone()
-        if ret and ret["inserted_flag"]:
-            inserted += 1
-        else:
-            updated += 1
+                sent = 0
+                for r in rows:
+                    msg = (
+                        f"🚨 <b>PREVITA – ALERTA {r['recommendation_level']}</b>\n\n"
+                        f"🧾 <b>Atendimento:</b> {r['cod_atendimento']}\n"
+                        f"🕒 <b>Snapshot:</b> {r['snapshot_ts']}\n"
+                        f"🧠 <b>Síndrome:</b> {r['syndrome'] or '-'}\n"
+                        f"📊 <b>Confiança:</b> {r['confidence'] or '-'}\n\n"
+                        f"✅ <b>Ações:</b>\n{(r['actions'] or '').strip()[:3500]}"
+                    )
+                    send_telegram_message_sync(msg)
 
-    conn.commit()
-    cur.close()
-    conn.close()
+                    cur.execute("""
+                        UPDATE public.clinical_recommendations
+                        SET
+                            notified_at = CASE
+                                WHEN recommendation_level = 'PRIORIDADE'
+                                THEN CURRENT_TIMESTAMP
+                                ELSE notified_at
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s;
+                    """, (r["id"],))
+                    sent += 1
 
-        # recomendações: só se houve mudança no banco
-    changed = inserted + updated
-    if changed > 0:
-        rec_rows = [{
-            "cod_atendimento": r["cod_atendimento"],
-            "event_ts": r["event_ts"],
-            "pas": r["pas"],
-            "spo2": r["spo2"]
-        } for r in normalized]
-        recs = compute_recommendations_for_rows(rec_rows)
-        background.add_task(persist_recommendations_and_notify, recs)
-    else:
-        recs = []
+            conn.commit()
 
-    return {
-        "ok": True,
-        "received": len(raw_rows),
-        "parsed": len(normalized),
-        "inserted": inserted,
-        "updated": updated,
-        "recs_generated": len(recs),
-        "row_errors": errors[:10],
-    }
+        return {"ok": True, "found": len(rows), "sent": sent}
 
-
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
