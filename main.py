@@ -447,10 +447,19 @@ async def vitals_batch(
     cur.close()
     conn.close()
 
-    # recomendações com base nas linhas já normalizadas
-    rec_rows = [{"cod_atendimento": r["cod_atendimento"], "event_ts": r["event_ts"], "pas": r["pas"], "spo2": r["spo2"]} for r in normalized]
-    recs = compute_recommendations_for_rows(rec_rows)
-    background.add_task(persist_recommendations_and_notify, recs)
+        # recomendações: só se houve mudança no banco
+    changed = inserted + updated
+    if changed > 0:
+        rec_rows = [{
+            "cod_atendimento": r["cod_atendimento"],
+            "event_ts": r["event_ts"],
+            "pas": r["pas"],
+            "spo2": r["spo2"]
+        } for r in normalized]
+        recs = compute_recommendations_for_rows(rec_rows)
+        background.add_task(persist_recommendations_and_notify, recs)
+    else:
+        recs = []
 
     return {
         "ok": True,
@@ -461,3 +470,5 @@ async def vitals_batch(
         "recs_generated": len(recs),
         "row_errors": errors[:10],
     }
+
+
