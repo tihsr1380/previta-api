@@ -1,17 +1,16 @@
 # =========================
-# PREVITA API — MAIN (v3.3.0)
+# PREVITA API — MAIN (v3.3.1) — NEON POOLER FIX
 # =========================
-# Objetivos (nível sênior):
-# - Corrigir definitivamente erro IPv6 no Render (Neon) forçando IPv4 via hostaddr
-# - Não derrubar o app no startup se o DB oscilar (retry)
-# - Aceitar payload do Power Automate em múltiplos formatos:
-#     1) {"rows":[{...},{...}]}
-#     2) [{...},{...}]
-#     3) {"rows": { ...obj... }}  -> converte para lista [obj]
-# - Normalizar chaves do PowerBI (VW_PREVITA_VITAIS_AGRUPADOS[...]) e chaves curtas
-# - Construir event_ts robusto (DATA_HORA_LANC_MINUTO pode vir zerado)
-# - Upsert MERGE (não perde campos: se antes veio NULL e depois vem valor, atualiza)
-# - Responder rápido para Power Automate (processa DB em background)
+# Fixes:
+# - Remove "options=-c statement_timeout=..." (Neon pooler não suporta startup param)
+# - Aplica statement_timeout via "SET statement_timeout" após conectar
+# - Remove/ignora channel_binding (recomendado remover do DATABASE_URL)
+# - Força IPv4 via hostaddr (Render frequentemente sem rota IPv6)
+# - Aceita payload Power Automate em formatos variados
+# - Normaliza chaves PowerBI + chaves curtas
+# - event_ts robusto (corrige DATA_HORA_LANC_MINUTO zerado)
+# - Upsert MERGE para não perder campos
+# - Responde rápido (background)
 
 import os
 import time
@@ -29,7 +28,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # =========================
 # APP
 # =========================
-app = FastAPI(title="PREVITA API", version="3.3.0")
+app = FastAPI(title="PREVITA API", version="3.3.1")
 
 # =========================
 # ENV
@@ -65,55 +64,53 @@ def send_telegram_message_sync(text: str):
         pass
 
 # =========================
-# DB CONNECT (Render + Neon) — FORÇA IPv4
+# DB CONNECT (Render + Neon) — FORÇA IPv4 + evita params problemáticos
 # =========================
 def _resolve_ipv4_or_fail(hostname: str) -> str:
-    """
-    Resolve apenas A record (IPv4). Render frequentemente não tem rota IPv6.
-    """
     infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
     if not infos:
         raise RuntimeError(f"Não consegui resolver IPv4 para {hostname}")
     return infos[0][4][0]
 
 def _extract_hostname_from_url(db_url: str) -> str:
-    """
-    Extrai hostname do DATABASE_URL no formato:
-    postgresql://user:pass@HOST:PORT/db?params
-    """
     if "@" not in db_url:
         raise RuntimeError("DATABASE_URL inválida: falta '@'")
-
     after_at = db_url.split("@", 1)[1]
     host_port = after_at.split("/", 1)[0]
 
-    # suporte a [ipv6]:port, mas aqui queremos detectar e evitar
+    # suporte a [ipv6]:port (não recomendado aqui)
     if host_port.startswith("[") and "]" in host_port:
-        host = host_port.split("]")[0].lstrip("[")
-        return host
+        return host_port.split("]")[0].lstrip("[")
 
     # host:port
     if ":" in host_port:
         return host_port.split(":")[0]
-
     return host_port
 
 def _strip_bad_params(db_url: str) -> str:
     """
-    Remove parâmetros que costumam quebrar ou não serem necessários em pooler/Render.
-    Principal: channel_binding=require (pode causar dor de cabeça)
+    Remove parâmetros que atrapalham:
+    - channel_binding=require (recomendado remover)
     """
-    # se não tem querystring, nada a fazer
     if "?" not in db_url:
         return db_url
 
     base, qs = db_url.split("?", 1)
     parts = [p for p in qs.split("&") if p.strip()]
-
-    # remove channel_binding=require
     parts = [p for p in parts if not p.lower().startswith("channel_binding=")]
-
     return base + "?" + "&".join(parts) if parts else base
+
+def _configure_session(conn: psycopg.Connection):
+    """
+    Neon Pooler não aceita startup param statement_timeout.
+    Então setamos depois que conecta.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = 15000;")  # 15s
+    except Exception:
+        # não derruba ingest se esse SET falhar por qualquer motivo
+        pass
 
 def get_conn():
     if not DATABASE_URL:
@@ -121,22 +118,18 @@ def get_conn():
 
     url = _strip_bad_params(DATABASE_URL)
     host = _extract_hostname_from_url(url)
-
-    # Força IPv4
     ipv4 = _resolve_ipv4_or_fail(host)
 
-    # hostaddr força libpq a usar IPv4, mantendo host para TLS/SNI
-    if "?" in url:
-        conninfo = f"{url}&hostaddr={ipv4}"
-    else:
-        conninfo = f"{url}?hostaddr={ipv4}"
+    # hostaddr força IPv4, mantendo hostname para TLS/SNI
+    conninfo = f"{url}&hostaddr={ipv4}" if "?" in url else f"{url}?hostaddr={ipv4}"
 
-    return psycopg.connect(
+    conn = psycopg.connect(
         conninfo,
         row_factory=dict_row,
         connect_timeout=10,
-        options="-c statement_timeout=15000",
     )
+    _configure_session(conn)
+    return conn
 
 # =========================
 # INIT TABLES (com retry)
@@ -174,9 +167,6 @@ def ensure_tables_once():
         conn.commit()
 
 def ensure_tables_with_retry(max_seconds: int = 45) -> bool:
-    """
-    Não derruba a API se o banco estiver em cold start / indisponível momentâneo.
-    """
     start = time.time()
     wait = 1.0
     last_err: Optional[Exception] = None
@@ -184,7 +174,7 @@ def ensure_tables_with_retry(max_seconds: int = 45) -> bool:
     while time.time() - start < max_seconds:
         try:
             ensure_tables_once()
-            print("[OK] Tabelas garantidas / DB OK")
+            print("[OK] DB OK / tabelas garantidas")
             return True
         except Exception as e:
             last_err = e
@@ -192,7 +182,7 @@ def ensure_tables_with_retry(max_seconds: int = 45) -> bool:
             time.sleep(wait)
             wait = min(wait * 1.7, 6.0)
 
-    print(f"[WARN] DB não ficou pronto no startup (seguindo mesmo assim). Último erro: {last_err}")
+    print(f"[WARN] DB não ficou pronto no startup (seguindo). Último erro: {last_err}")
     return False
 
 @app.on_event("startup")
@@ -257,13 +247,6 @@ def _parse_iso_dt(v: Any) -> Optional[datetime]:
         return None
 
 def _parse_event_ts(d: Dict[str, Any]) -> datetime:
-    """
-    DATA_HORA_LANC_MINUTO às vezes vem zerado (00:00:00).
-    Prioridade:
-      1) event_ts
-      2) DATA_HORA_LANC_MINUTO (se não zerado)
-      3) DATA_LANC + HORA_LANC + MINUTO_LANC
-    """
     ev = _parse_iso_dt(_pick(d, "event_ts", "EVENT_TS"))
     if ev:
         return ev
@@ -274,7 +257,6 @@ def _parse_event_ts(d: Dict[str, Any]) -> datetime:
     m = _to_int(_pick(d, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]"))
 
     if dh:
-        # se vier 00:00:00 mas hora/minuto existem, reconstruímos pelo DATA_LANC
         if (dh.hour == 0 and dh.minute == 0) and dl and (h is not None or m is not None):
             return dl.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
         return dh
@@ -284,9 +266,6 @@ def _parse_event_ts(d: Dict[str, Any]) -> datetime:
     return dl.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
 
 def normalize_powerbi_rows(raw_rows: List[Dict[str, Any]]) -> List[VitalRow]:
-    """
-    Aceita chaves curtas e chaves PowerBI VW_PREVITA_VITAIS_AGRUPADOS[...]
-    """
     out: List[VitalRow] = []
     for r in raw_rows:
         try:
@@ -326,7 +305,7 @@ def health():
     return {"status": "ok"}
 
 # =========================
-# DB PING (testar rapidamente no navegador)
+# DB PING
 # =========================
 @app.get("/v1/db/ping")
 def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
@@ -341,17 +320,11 @@ def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
 # PERSISTÊNCIA (UPSERT MERGE)
 # =========================
 def persist_rows_merge(rows: List[VitalRow]) -> int:
-    """
-    Upsert com merge:
-    - não perde valores já gravados
-    - se chegar depois com campos antes NULL, preenche
-    """
     count = 0
     with get_conn() as conn:
         with conn.cursor() as cur:
             for r in rows:
                 event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
-
                 cur.execute("""
                     INSERT INTO public.vitals_events (
                         event_key, cod_atendimento, id_ricadpac, event_ts,
@@ -389,16 +362,16 @@ def persist_rows_merge(rows: List[VitalRow]) -> int:
 # =========================
 @app.post("/v1/vitals/batch")
 def vitals_batch(
-    payload: Any,  # aceita dict/list
+    payload: Any,
     background: BackgroundTasks,
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
 
-    # Formatos aceitos:
+    # formatos aceitos:
     # 1) {"rows":[...]}
     # 2) [...]
-    # 3) {"rows": {...obj...}} (vira lista com 1 item)
+    # 3) {"rows": {...}} -> vira [obj]
     raw_rows: List[Dict[str, Any]]
 
     if isinstance(payload, dict) and "rows" in payload:
@@ -419,13 +392,9 @@ def vitals_batch(
     if not raw_rows:
         return {"ok": True, "queued": 0, "message": "Sem linhas"}
 
-    # Normaliza
     rows = normalize_powerbi_rows(raw_rows)
     if not rows:
         return {"ok": True, "queued": 0, "message": "Linhas inválidas / sem campos mínimos"}
 
-    # Background para não estourar timeout no Power Automate
     background.add_task(persist_rows_merge, rows)
-
-    # Resposta imediata
     return {"ok": True, "queued": len(rows), "message": "Processando em background"}
