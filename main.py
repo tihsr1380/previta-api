@@ -280,13 +280,16 @@ def _parse_event_ts(row: Dict[str, Any]) -> datetime:
     return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
 
 
+import re
+
 def _extract_rows_from_any_payload(payload: Any) -> List[Dict[str, Any]]:
     """
     Aceita:
     1) {"rows":[...]}
-    2) [...]
+    2) [...] (lista direta)
     3) PowerBI Query bruto: {"results":[{"tables":[{"rows":[...]}]}]}
        (às vezes vem encapsulado em {"body":{...}})
+    4) Power Automate achatado: {"rows.0.[SPO2]": 98, "rows.0.[FC]": 88, ...}
     """
     if payload is None:
         return []
@@ -295,15 +298,16 @@ def _extract_rows_from_any_payload(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, dict) and "body" in payload and isinstance(payload["body"], (dict, list)):
         payload = payload["body"]
 
+    # 2) lista direta
     if isinstance(payload, list):
-        # lista direta
         return [r for r in payload if isinstance(r, dict)]
 
     if isinstance(payload, dict):
+        # 1) {"rows":[...]}
         if isinstance(payload.get("rows"), list):
             return [r for r in payload["rows"] if isinstance(r, dict)]
 
-        # formato powerbi
+        # 3) formato powerbi
         results = payload.get("results")
         if isinstance(results, list) and results:
             tables = (results[0] or {}).get("tables")
@@ -312,7 +316,28 @@ def _extract_rows_from_any_payload(payload: Any) -> List[Dict[str, Any]]:
                 if isinstance(rows, list):
                     return [r for r in rows if isinstance(r, dict)]
 
+        # 4) Power Automate achatado (rows.8.[SPO2])
+        # Ex: "rows.8.[SPO2]": 98
+        flattened = {}
+        pat = re.compile(r"^rows\.(\d+)\.\[(.+?)\]$")
+        max_i = -1
+        for k, v in payload.items():
+            if not isinstance(k, str):
+                continue
+            m = pat.match(k)
+            if not m:
+                continue
+            i = int(m.group(1))
+            field = m.group(2)
+            max_i = max(max_i, i)
+            flattened.setdefault(i, {})[field] = v
+
+        if max_i >= 0:
+            # retorna lista ordenada por índice
+            return [flattened[i] for i in sorted(flattened.keys())]
+
     return []
+
 
 
 def normalize_rows(raw_rows: List[Dict[str, Any]]) -> List[VitalRow]:
@@ -637,3 +662,4 @@ def notify_telegram_run(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
