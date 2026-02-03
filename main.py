@@ -1,37 +1,43 @@
 # =========================
-# PREVITA API — MAIN (v4)
-# FAST + SAFE + POWERBI READY
-# - aceita payload do PowerBI/Automate em vários formatos
-# - normaliza chaves curtas e VW_[...]
-# - reconstrói event_ts quando DATA_HORA_LANC_MINUTO vem zerado
-# - upsert com MERGE (não perde campos)
-# - responde rápido (202) e grava em background
-# - sem psycopg_pool (evita ModuleNotFound no Render)
+# PREVITA API — MAIN (v3.3.0)
 # =========================
+# Objetivos (nível sênior):
+# - Corrigir definitivamente erro IPv6 no Render (Neon) forçando IPv4 via hostaddr
+# - Não derrubar o app no startup se o DB oscilar (retry)
+# - Aceitar payload do Power Automate em múltiplos formatos:
+#     1) {"rows":[{...},{...}]}
+#     2) [{...},{...}]
+#     3) {"rows": { ...obj... }}  -> converte para lista [obj]
+# - Normalizar chaves do PowerBI (VW_PREVITA_VITAIS_AGRUPADOS[...]) e chaves curtas
+# - Construir event_ts robusto (DATA_HORA_LANC_MINUTO pode vir zerado)
+# - Upsert MERGE (não perde campos: se antes veio NULL e depois vem valor, atualiza)
+# - Responder rápido para Power Automate (processa DB em background)
 
 import os
-import time as _time
-from typing import Optional, List, Dict, Any, Union
+import time
+import socket
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 import requests
 import psycopg
 from psycopg.rows import dict_row
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Response, status
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel, Field, ConfigDict
 
+# =========================
+# APP
+# =========================
+app = FastAPI(title="PREVITA API", version="3.3.0")
 
 # =========================
-# APP / ENV
+# ENV
 # =========================
-app = FastAPI(title="PREVITA API", version="4.0.0")
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
 
 # =========================
 # AUTH
@@ -39,7 +45,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 def _check_key(x_api_key: Optional[str]):
     if ALERT_API_KEY and x_api_key != ALERT_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
 
 # =========================
 # TELEGRAM (opcional)
@@ -59,61 +64,105 @@ def send_telegram_message_sync(text: str):
     except Exception:
         pass
 
+# =========================
+# DB CONNECT (Render + Neon) — FORÇA IPv4
+# =========================
+def _resolve_ipv4_or_fail(hostname: str) -> str:
+    """
+    Resolve apenas A record (IPv4). Render frequentemente não tem rota IPv6.
+    """
+    infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+    if not infos:
+        raise RuntimeError(f"Não consegui resolver IPv4 para {hostname}")
+    return infos[0][4][0]
 
-# =========================
-# DB
-# =========================
+def _extract_hostname_from_url(db_url: str) -> str:
+    """
+    Extrai hostname do DATABASE_URL no formato:
+    postgresql://user:pass@HOST:PORT/db?params
+    """
+    if "@" not in db_url:
+        raise RuntimeError("DATABASE_URL inválida: falta '@'")
+
+    after_at = db_url.split("@", 1)[1]
+    host_port = after_at.split("/", 1)[0]
+
+    # suporte a [ipv6]:port, mas aqui queremos detectar e evitar
+    if host_port.startswith("[") and "]" in host_port:
+        host = host_port.split("]")[0].lstrip("[")
+        return host
+
+    # host:port
+    if ":" in host_port:
+        return host_port.split(":")[0]
+
+    return host_port
+
+def _strip_bad_params(db_url: str) -> str:
+    """
+    Remove parâmetros que costumam quebrar ou não serem necessários em pooler/Render.
+    Principal: channel_binding=require (pode causar dor de cabeça)
+    """
+    # se não tem querystring, nada a fazer
+    if "?" not in db_url:
+        return db_url
+
+    base, qs = db_url.split("?", 1)
+    parts = [p for p in qs.split("&") if p.strip()]
+
+    # remove channel_binding=require
+    parts = [p for p in parts if not p.lower().startswith("channel_binding=")]
+
+    return base + "?" + "&".join(parts) if parts else base
+
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada no Render")
-    # timeouts defensivos para Render/Neon
+
+    url = _strip_bad_params(DATABASE_URL)
+    host = _extract_hostname_from_url(url)
+
+    # Força IPv4
+    ipv4 = _resolve_ipv4_or_fail(host)
+
+    # hostaddr força libpq a usar IPv4, mantendo host para TLS/SNI
+    if "?" in url:
+        conninfo = f"{url}&hostaddr={ipv4}"
+    else:
+        conninfo = f"{url}?hostaddr={ipv4}"
+
     return psycopg.connect(
-        DATABASE_URL,
+        conninfo,
         row_factory=dict_row,
         connect_timeout=10,
         options="-c statement_timeout=15000",
     )
 
-
+# =========================
+# INIT TABLES (com retry)
+# =========================
 def ensure_tables_once():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_events (
                     id BIGSERIAL PRIMARY KEY,
-
-                    -- chave de idempotência (única)
                     event_key TEXT UNIQUE,
-
-                    -- opcional (se você quiser rastrear o ID do registro do PowerBI)
-                    source_id BIGINT NULL,
-
                     cod_atendimento INT NOT NULL,
                     id_ricadpac INT NULL,
-
-                    -- carimbo do evento (real)
                     event_ts TIMESTAMP NOT NULL,
-
-                    -- componentes (úteis p/ debug e reconstrução)
-                    data_lanc DATE NULL,
                     hora INT NULL,
                     minuto INT NULL,
-
                     temp DOUBLE PRECISION NULL,
                     pas INT NULL,
                     pad INT NULL,
                     fc INT NULL,
                     fr INT NULL,
                     spo2 INT NULL,
-
                     dor TEXT NULL,
                     uso_o2 TEXT NULL,
                     nivel_consciencia TEXT NULL,
                     profissional TEXT NULL,
-
-                    -- guarda o payload cru (pra auditoria / não perder dado)
-                    raw JSONB NULL,
-
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -122,57 +171,36 @@ def ensure_tables_once():
                 CREATE INDEX IF NOT EXISTS idx_vitals_events_ts
                 ON public.vitals_events (event_ts DESC);
             """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_vitals_events_att_ts
-                ON public.vitals_events (cod_atendimento, event_ts DESC);
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
-                    id BIGSERIAL PRIMARY KEY,
-                    cod_atendimento INT NOT NULL,
-                    snapshot_ts TIMESTAMP NOT NULL,
-                    recommendation_level TEXT NOT NULL, -- IMEDIATO | PRIORIDADE | OK
-                    syndrome TEXT NULL,
-                    confidence DOUBLE PRECISION NULL,
-                    actions TEXT NULL,
-                    notified_at TIMESTAMP NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts
-                ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);
-            """)
         conn.commit()
 
-
 def ensure_tables_with_retry(max_seconds: int = 45) -> bool:
-    start = _time.time()
+    """
+    Não derruba a API se o banco estiver em cold start / indisponível momentâneo.
+    """
+    start = time.time()
     wait = 1.0
-    last_err = None
+    last_err: Optional[Exception] = None
 
-    while _time.time() - start < max_seconds:
+    while time.time() - start < max_seconds:
         try:
             ensure_tables_once()
+            print("[OK] Tabelas garantidas / DB OK")
             return True
         except Exception as e:
             last_err = e
-            _time.sleep(wait)
+            print(f"[WARN] DB ainda não pronto: {e}")
+            time.sleep(wait)
             wait = min(wait * 1.7, 6.0)
 
-    print(f"[WARN] DB não ficou pronto a tempo no startup: {last_err}")
+    print(f"[WARN] DB não ficou pronto no startup (seguindo mesmo assim). Último erro: {last_err}")
     return False
-
 
 @app.on_event("startup")
 def _startup():
     ensure_tables_with_retry()
 
-
 # =========================
-# MODELS
+# MODELS / NORMALIZAÇÃO
 # =========================
 class VitalRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -181,10 +209,8 @@ class VitalRow(BaseModel):
     id_ricadpac: Optional[int] = None
     event_ts: datetime
 
-    data_lanc: Optional[str] = None  # manter string ISO (YYYY-MM-DD) e converter no SQL
     hora: Optional[int] = None
     minuto: Optional[int] = None
-
     temp: Optional[float] = None
     pas: Optional[int] = None
     pad: Optional[int] = None
@@ -197,315 +223,147 @@ class VitalRow(BaseModel):
     nivel_consciencia: Optional[str] = None
     profissional: Optional[str] = None
 
-    source_id: Optional[int] = None
-    raw: Optional[Dict[str, Any]] = None
-
-
-# =========================
-# HELPERS: normalização PowerBI
-# =========================
 def _pick(d: Dict[str, Any], *keys: str) -> Any:
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
     return None
 
-
-def _to_int(x: Any) -> Optional[int]:
-    if x is None:
+def _to_int(v: Any) -> Optional[int]:
+    if v is None:
         return None
     try:
-        # PowerBI às vezes manda 21.037,00 ou "21037"
-        if isinstance(x, str):
-            x = x.replace(".", "").replace(",", ".")
-        return int(float(x))
+        return int(v)
     except Exception:
         return None
 
-
-def _to_float(x: Any) -> Optional[float]:
-    if x is None:
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
         return None
     try:
-        if isinstance(x, str):
-            x = x.replace(".", "").replace(",", ".")
-        return float(x)
+        return float(v)
     except Exception:
         return None
 
-
-def _parse_dt_iso(x: Any) -> Optional[datetime]:
-    if not x:
+def _parse_iso_dt(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
         return None
     try:
-        s = str(x).replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
 
-
-def _parse_event_ts(row: Dict[str, Any]) -> datetime:
+def _parse_event_ts(d: Dict[str, Any]) -> datetime:
     """
-    Estratégia robusta:
-    1) se vier EVENT_TS / event_ts
-    2) se vier DATA_HORA_LANC_MINUTO e NÃO estiver zerado
-    3) senão: DATA_LANC + HORA_LANC + MINUTO_LANC
+    DATA_HORA_LANC_MINUTO às vezes vem zerado (00:00:00).
+    Prioridade:
+      1) event_ts
+      2) DATA_HORA_LANC_MINUTO (se não zerado)
+      3) DATA_LANC + HORA_LANC + MINUTO_LANC
     """
-    ev = _pick(row, "event_ts", "EVENT_TS")
-    dt = _parse_dt_iso(ev)
-    if dt:
-        return dt
+    ev = _parse_iso_dt(_pick(d, "event_ts", "EVENT_TS"))
+    if ev:
+        return ev
 
-    dh = _pick(row, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]")
-    dt_dh = _parse_dt_iso(dh)
+    dh = _parse_iso_dt(_pick(d, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]"))
+    dl = _parse_iso_dt(_pick(d, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]"))
+    h = _to_int(_pick(d, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]"))
+    m = _to_int(_pick(d, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]"))
 
-    dl = _pick(row, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
-    h = _pick(row, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")
-    m = _pick(row, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]")
+    if dh:
+        # se vier 00:00:00 mas hora/minuto existem, reconstruímos pelo DATA_LANC
+        if (dh.hour == 0 and dh.minute == 0) and dl and (h is not None or m is not None):
+            return dl.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
+        return dh
 
-    # se DATA_HORA_LANC_MINUTO existe e está OK, usa.
-    if dt_dh:
-        # Se vier 00:00:00 mas temos hora/minuto e data_lanc, reconstrói.
-        if (dt_dh.hour == 0 and dt_dh.minute == 0) and (h is not None or m is not None) and dl:
-            base = _parse_dt_iso(dl)
-            if not base:
-                raise ValueError("DATA_LANC inválida para reconstruir event_ts")
-            return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
-        return dt_dh
+    if not dl:
+        raise ValueError("Sem DATA_LANC para construir event_ts")
+    return dl.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
 
-    # fallback: DATA_LANC + HORA + MINUTO
-    base = _parse_dt_iso(dl)
-    if not base:
-        raise ValueError("Sem DATA_LANC válida para construir event_ts")
-    return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
-
-
-import re
-
-def _extract_rows_from_any_payload(payload: Any) -> List[Dict[str, Any]]:
+def normalize_powerbi_rows(raw_rows: List[Dict[str, Any]]) -> List[VitalRow]:
     """
-    Aceita:
-    1) {"rows":[...]}
-    2) [...] (lista direta)
-    3) PowerBI Query bruto: {"results":[{"tables":[{"rows":[...]}]}]}
-       (às vezes vem encapsulado em {"body":{...}})
-    4) Power Automate achatado: {"rows.0.[SPO2]": 98, "rows.0.[FC]": 88, ...}
+    Aceita chaves curtas e chaves PowerBI VW_PREVITA_VITAIS_AGRUPADOS[...]
     """
-    if payload is None:
-        return []
-
-    # payload pode vir como {"body": {...}}
-    if isinstance(payload, dict) and "body" in payload and isinstance(payload["body"], (dict, list)):
-        payload = payload["body"]
-
-    # 2) lista direta
-    if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)]
-
-    if isinstance(payload, dict):
-        # 1) {"rows":[...]}
-        if isinstance(payload.get("rows"), list):
-            return [r for r in payload["rows"] if isinstance(r, dict)]
-
-        # 3) formato powerbi
-        results = payload.get("results")
-        if isinstance(results, list) and results:
-            tables = (results[0] or {}).get("tables")
-            if isinstance(tables, list) and tables:
-                rows = (tables[0] or {}).get("rows")
-                if isinstance(rows, list):
-                    return [r for r in rows if isinstance(r, dict)]
-
-        # 4) Power Automate achatado (rows.8.[SPO2])
-        # Ex: "rows.8.[SPO2]": 98
-        flattened = {}
-        pat = re.compile(r"^rows\.(\d+)\.\[(.+?)\]$")
-        max_i = -1
-        for k, v in payload.items():
-            if not isinstance(k, str):
-                continue
-            m = pat.match(k)
-            if not m:
-                continue
-            i = int(m.group(1))
-            field = m.group(2)
-            max_i = max(max_i, i)
-            flattened.setdefault(i, {})[field] = v
-
-        if max_i >= 0:
-            # retorna lista ordenada por índice
-            return [flattened[i] for i in sorted(flattened.keys())]
-
-    return []
-
-
-
-def normalize_rows(raw_rows: List[Dict[str, Any]]) -> List[VitalRow]:
     out: List[VitalRow] = []
-
     for r in raw_rows:
         try:
-            cod = _to_int(_pick(r, "COD_ATENDIMENTO", "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]"))
-            if not cod:
+            cod = _pick(r, "COD_ATENDIMENTO", "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]")
+            if cod is None:
                 raise ValueError("Sem COD_ATENDIMENTO")
 
-            id_r = _to_int(_pick(r, "ID_RICADPAC", "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]"))
-            src_id = _to_int(_pick(r, "ID", "VW_PREVITA_VITAIS_AGRUPADOS[ID]"))
+            payload = {
+                "cod_atendimento": int(cod),
+                "id_ricadpac": _to_int(_pick(r, "ID_RICADPAC", "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]")),
+                "event_ts": _parse_event_ts(r),
 
-            dl = _pick(r, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
-            dl_iso = None
-            if dl:
-                dt_dl = _parse_dt_iso(dl)
-                if dt_dl:
-                    dl_iso = dt_dl.date().isoformat()
+                "hora": _to_int(_pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")),
+                "minuto": _to_int(_pick(r, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]")),
 
-            event_ts = _parse_event_ts(r)
-
-            row = VitalRow(
-                cod_atendimento=cod,
-                id_ricadpac=id_r,
-                source_id=src_id,
-                event_ts=event_ts,
-
-                data_lanc=dl_iso,
-                hora=_to_int(_pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")),
-                minuto=_to_int(_pick(r, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]")),
-
-                temp=_to_float(_pick(r, "TEMP", "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]")),
-                dor=str(_pick(r, "DOR", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]")) if _pick(r, "DOR", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]") is not None else None,
-                fr=_to_int(_pick(r, "FR", "VW_PREVITA_VITAIS_AGRUPADOS[FR]")),
-                fc=_to_int(_pick(r, "FC", "VW_PREVITA_VITAIS_AGRUPADOS[FC]")),
-                pad=_to_int(_pick(r, "PAD", "VW_PREVITA_VITAIS_AGRUPADOS[PAD]")),
-                pas=_to_int(_pick(r, "PAS", "VW_PREVITA_VITAIS_AGRUPADOS[PAS]")),
-                spo2=_to_int(_pick(r, "SPO2", "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]")),
-                uso_o2=str(_pick(r, "USO_O2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]")) if _pick(r, "USO_O2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]") is not None else None,
-                nivel_consciencia=str(_pick(r, "NIVEL_CONSCIENCIA", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]")) if _pick(r, "NIVEL_CONSCIENCIA", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]") is not None else None,
-                profissional=str(_pick(r, "PROFISSIONAL", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]")) if _pick(r, "PROFISSIONAL", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]") is not None else None,
-
-                raw=r,
-            )
-
-            out.append(row)
+                "temp": _to_float(_pick(r, "TEMP", "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]")),
+                "dor": _pick(r, "DOR", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]"),
+                "fr": _to_int(_pick(r, "FR", "VW_PREVITA_VITAIS_AGRUPADOS[FR]")),
+                "fc": _to_int(_pick(r, "FC", "VW_PREVITA_VITAIS_AGRUPADOS[FC]")),
+                "pad": _to_int(_pick(r, "PAD", "VW_PREVITA_VITAIS_AGRUPADOS[PAD]")),
+                "pas": _to_int(_pick(r, "PAS", "VW_PREVITA_VITAIS_AGRUPADOS[PAS]")),
+                "spo2": _to_int(_pick(r, "SPO2", "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]")),
+                "uso_o2": _pick(r, "USO_O2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]"),
+                "nivel_consciencia": _pick(r, "NIVEL_CONSCIENCIA", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]"),
+                "profissional": _pick(r, "PROFISSIONAL", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]"),
+            }
+            out.append(VitalRow(**payload))
         except Exception as e:
-            print(f"[WARN] Linha ignorada (inválida): {e} | row={r}")
-
+            print(f"[WARN] Linha inválida ignorada: {e}. Row={r}")
     return out
 
+# =========================
+# HEALTH
+# =========================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 # =========================
-# RECOMMENDATIONS (simples / placeholder)
+# DB PING (testar rapidamente no navegador)
 # =========================
-def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
-    recs: List[Dict[str, Any]] = []
-    for r in rows:
-        level = "OK"
-        syndrome = None
-        confidence = None
-        actions = None
-
-        if r.spo2 is not None and r.spo2 < 92:
-            level = "PRIORIDADE"
-            syndrome = "Hipoxemia"
-            confidence = 0.7
-            actions = "Reavaliar oximetria, verificar O2, checar desconforto respiratório e acionar protocolo."
-
-        if r.pas is not None and r.pas < 90:
-            level = "IMEDIATO"
-            syndrome = "Hipotensão"
-            confidence = 0.8
-            actions = "Checar PA manual, perfusão, sangramento/dor e acionar médico conforme protocolo."
-
-        if level != "OK":
-            recs.append({
-                "cod_atendimento": r.cod_atendimento,
-                "snapshot_ts": r.event_ts,
-                "recommendation_level": level,
-                "syndrome": syndrome,
-                "confidence": confidence,
-                "actions": actions,
-            })
-    return recs
-
-
-def persist_recommendations_and_notify(recs: List[Dict[str, Any]]):
-    if not recs:
-        return
-
+@app.get("/v1/db/ping")
+def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
+    _check_key(x_api_key)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            for rec in recs:
-                cur.execute("""
-                    INSERT INTO public.clinical_recommendations
-                        (cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP);
-                """, (
-                    rec["cod_atendimento"],
-                    rec["snapshot_ts"],
-                    rec["recommendation_level"],
-                    rec.get("syndrome"),
-                    rec.get("confidence"),
-                    rec.get("actions"),
-                ))
-
-                if rec["recommendation_level"] == "IMEDIATO":
-                    msg = (
-                        f"🚨 <b>PREVITA – ALERTA IMEDIATO</b>\n\n"
-                        f"🧾 <b>Atendimento:</b> {rec['cod_atendimento']}\n"
-                        f"🕒 <b>Snapshot:</b> {rec['snapshot_ts']}\n"
-                        f"🧠 <b>Síndrome:</b> {rec.get('syndrome') or '-'}\n"
-                        f"✅ <b>Ações:</b>\n{(rec.get('actions') or '-').strip()[:3500]}"
-                    )
-                    send_telegram_message_sync(msg)
-
-        conn.commit()
-
+            cur.execute("SELECT 1 AS ok;")
+            r = cur.fetchone()
+    return {"ok": True, "db": r["ok"]}
 
 # =========================
-# PERSIST (UPSERT COM MERGE)
+# PERSISTÊNCIA (UPSERT MERGE)
 # =========================
-def persist_rows_merge(rows: List[VitalRow]) -> Dict[str, int]:
-    inserted = 0
-    updated = 0
-
+def persist_rows_merge(rows: List[VitalRow]) -> int:
+    """
+    Upsert com merge:
+    - não perde valores já gravados
+    - se chegar depois com campos antes NULL, preenche
+    """
+    count = 0
     with get_conn() as conn:
         with conn.cursor() as cur:
             for r in rows:
-                # 🔑 event_key robusta:
-                # usa COD + DATA_LANC + HORA + MINUTO quando existir,
-                # senão usa COD + event_ts iso.
-                if r.data_lanc and r.hora is not None and r.minuto is not None:
-                    event_key = f"{r.cod_atendimento}|{r.data_lanc}|{int(r.hora)}|{int(r.minuto)}"
-                else:
-                    event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
+                event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
 
                 cur.execute("""
                     INSERT INTO public.vitals_events (
-                        event_key, source_id,
-                        cod_atendimento, id_ricadpac,
-                        event_ts, data_lanc, hora, minuto,
-                        temp, pas, pad, fc, fr, spo2,
+                        event_key, cod_atendimento, id_ricadpac, event_ts,
+                        hora, minuto, temp, pas, pad, fc, fr, spo2,
                         dor, uso_o2, nivel_consciencia, profissional,
-                        raw,
                         updated_at
                     )
-                    VALUES (
-                        %s, %s,
-                        %s, %s,
-                        %s, %s::date, %s, %s,
-                        %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s::jsonb,
-                        CURRENT_TIMESTAMP
-                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
                     ON CONFLICT (event_key) DO UPDATE SET
-                        source_id          = COALESCE(EXCLUDED.source_id, vitals_events.source_id),
                         id_ricadpac        = COALESCE(EXCLUDED.id_ricadpac, vitals_events.id_ricadpac),
-
-                        event_ts           = COALESCE(EXCLUDED.event_ts, vitals_events.event_ts),
-                        data_lanc          = COALESCE(EXCLUDED.data_lanc, vitals_events.data_lanc),
-                        hora               = COALESCE(EXCLUDED.hora, vitals_events.hora),
-                        minuto             = COALESCE(EXCLUDED.minuto, vitals_events.minuto),
-
+                        hora              = COALESCE(EXCLUDED.hora, vitals_events.hora),
+                        minuto            = COALESCE(EXCLUDED.minuto, vitals_events.minuto),
                         temp              = COALESCE(EXCLUDED.temp, vitals_events.temp),
                         pas               = COALESCE(EXCLUDED.pas, vitals_events.pas),
                         pad               = COALESCE(EXCLUDED.pad, vitals_events.pad),
@@ -516,150 +374,58 @@ def persist_rows_merge(rows: List[VitalRow]) -> Dict[str, int]:
                         uso_o2            = COALESCE(EXCLUDED.uso_o2, vitals_events.uso_o2),
                         nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_events.nivel_consciencia),
                         profissional      = COALESCE(EXCLUDED.profissional, vitals_events.profissional),
-
-                        raw               = COALESCE(EXCLUDED.raw, vitals_events.raw),
-
                         updated_at        = CURRENT_TIMESTAMP;
                 """, (
-                    event_key, r.source_id,
-                    r.cod_atendimento, r.id_ricadpac,
-                    r.event_ts, r.data_lanc, r.hora, r.minuto,
-                    r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
-                    r.dor, r.uso_o2, r.nivel_consciencia, r.profissional,
-                    psycopg.types.json.Json(r.raw) if r.raw is not None else None,
+                    event_key, r.cod_atendimento, r.id_ricadpac, r.event_ts,
+                    r.hora, r.minuto, r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
+                    r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
                 ))
-
-                status_msg = (cur.statusmessage or "").upper()
-                if status_msg.startswith("INSERT"):
-                    inserted += 1
-                elif status_msg.startswith("UPDATE"):
-                    updated += 1
-
+                count += 1
         conn.commit()
-
-    return {"inserted": inserted, "updated": updated}
-
-
-def _background_job(rows: List[VitalRow]):
-    try:
-        stats = persist_rows_merge(rows)
-        recs = compute_recommendations(rows)
-        persist_recommendations_and_notify(recs)
-        print(f"[INGEST] OK stats={stats} recs={len(recs)}")
-    except Exception as e:
-        print(f"[INGEST] ERROR: {e}")
-
+    return count
 
 # =========================
-# ENDPOINTS
+# INGEST — BATCH (aceita vários formatos e responde rápido)
 # =========================
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/v1/db/ping")
-def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
-    _check_key(x_api_key)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 AS ok;")
-            r = cur.fetchone()
-    return {"ok": True, "db": r["ok"]}
-
-
 @app.post("/v1/vitals/batch")
 def vitals_batch(
-    payload: Any,  # aceita qualquer formato
+    payload: Any,  # aceita dict/list
     background: BackgroundTasks,
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
 
-    raw_rows = _extract_rows_from_any_payload(payload)
+    # Formatos aceitos:
+    # 1) {"rows":[...]}
+    # 2) [...]
+    # 3) {"rows": {...obj...}} (vira lista com 1 item)
+    raw_rows: List[Dict[str, Any]]
+
+    if isinstance(payload, dict) and "rows" in payload:
+        r = payload.get("rows")
+        if r is None:
+            raw_rows = []
+        elif isinstance(r, list):
+            raw_rows = r
+        elif isinstance(r, dict):
+            raw_rows = [r]
+        else:
+            raise HTTPException(status_code=422, detail="Campo 'rows' inválido. Use lista ou objeto.")
+    elif isinstance(payload, list):
+        raw_rows = payload
+    else:
+        raise HTTPException(status_code=422, detail="Payload inválido. Envie {'rows':[...]} ou uma lista [...]")
 
     if not raw_rows:
-        return {"ok": True, "queued": 0, "message": "Sem linhas no payload (rows vazio ou formato inválido)"}
+        return {"ok": True, "queued": 0, "message": "Sem linhas"}
 
-    rows = normalize_rows(raw_rows)
-
+    # Normaliza
+    rows = normalize_powerbi_rows(raw_rows)
     if not rows:
-        return {"ok": True, "queued": 0, "message": "Nenhuma linha válida após normalização"}
+        return {"ok": True, "queued": 0, "message": "Linhas inválidas / sem campos mínimos"}
 
-    # responde rápido (evita timeout do Power Automate)
-    background.add_task(_background_job, rows)
-    return Response(
-        content='{"ok": true, "queued": %d}' % len(rows),
-        media_type="application/json",
-        status_code=status.HTTP_202_ACCEPTED,
-    )
+    # Background para não estourar timeout no Power Automate
+    background.add_task(persist_rows_merge, rows)
 
-
-@app.post("/v1/notify/telegram/run")
-def notify_telegram_run(
-    max_send: int = 10,
-    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
-):
-    _check_key(x_api_key)
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        id,
-                        cod_atendimento,
-                        snapshot_ts,
-                        recommendation_level,
-                        syndrome,
-                        confidence,
-                        actions
-                    FROM public.clinical_recommendations
-                    WHERE
-                        recommendation_level IN ('IMEDIATO', 'PRIORIDADE')
-                        AND (
-                            recommendation_level = 'IMEDIATO'
-                            OR notified_at IS NULL
-                        )
-                    ORDER BY
-                        CASE recommendation_level
-                            WHEN 'IMEDIATO' THEN 2
-                            ELSE 1
-                        END DESC,
-                        snapshot_ts DESC
-                    LIMIT %s;
-                """, (max_send,))
-                rows = cur.fetchall()
-
-                sent = 0
-                for r in rows:
-                    msg = (
-                        f"🚨 <b>PREVITA – ALERTA {r['recommendation_level']}</b>\n\n"
-                        f"🧾 <b>Atendimento:</b> {r['cod_atendimento']}\n"
-                        f"🕒 <b>Snapshot:</b> {r['snapshot_ts']}\n"
-                        f"🧠 <b>Síndrome:</b> {r['syndrome'] or '-'}\n"
-                        f"📊 <b>Confiança:</b> {r['confidence'] or '-'}\n\n"
-                        f"✅ <b>Ações:</b>\n{(r['actions'] or '').strip()[:3500]}"
-                    )
-                    send_telegram_message_sync(msg)
-
-                    cur.execute("""
-                        UPDATE public.clinical_recommendations
-                        SET
-                            notified_at = CASE
-                                WHEN recommendation_level = 'PRIORIDADE'
-                                THEN CURRENT_TIMESTAMP
-                                ELSE notified_at
-                            END,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE id = %s;
-                    """, (r["id"],))
-                    sent += 1
-
-            conn.commit()
-
-        return {"ok": True, "found": len(rows), "sent": sent}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    # Resposta imediata
+    return {"ok": True, "queued": len(rows), "message": "Processando em background"}
