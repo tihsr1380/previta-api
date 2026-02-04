@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Body
 from pydantic import BaseModel, ConfigDict
 
-app = FastAPI(title="PREVITA API", version="4.0.5")
+app = FastAPI(title="PREVITA API", version="4.0.6")
 
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
@@ -22,7 +22,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 # ---------------------------
-# Segurança / Autenticação
+# Auth
 # ---------------------------
 def _check_key(x_api_key: Optional[str]):
     if ALERT_API_KEY and x_api_key != ALERT_API_KEY:
@@ -49,24 +49,17 @@ def send_telegram_message_sync(text: str):
 
 
 # ---------------------------
-# DB helpers
+# DB
 # ---------------------------
 def _sanitize_db_url(url: str) -> str:
-    """
-    Evita parâmetros que costumam causar erro no pooler do Neon.
-    Mantém sslmode/channel_binding, remove options e similares.
-    """
     if not url:
         return url
-
     p = urlparse(url)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
 
-    # remove parâmetros que podem virar startup parameter/option
-    # (e causar 500)
+    # remove possíveis parâmetros "problemáticos"
     for bad in ["options", "statement_timeout", "idle_in_transaction_session_timeout"]:
-        if bad in q:
-            q.pop(bad, None)
+        q.pop(bad, None)
 
     new_query = urlencode(q, doseq=True)
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
@@ -78,91 +71,48 @@ def get_conn():
 
     url = _sanitize_db_url(DATABASE_URL)
 
-    # Força options="" para anular PGOPTIONS do ambiente
-    # (isso elimina vários 'unsupported startup parameter')
+    # Força options="" para anular PGOPTIONS do ambiente (Neon pooler)
     return psycopg.connect(
         url,
         row_factory=dict_row,
         connect_timeout=12,
-        options="",   # <- crítico para Neon pooler
+        options="",
     )
 
 
-def ensure_schema_once():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # RAW
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.vitals_raw (
-                    id BIGSERIAL PRIMARY KEY,
-                    received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    source TEXT NULL,
-                    payload JSONB NOT NULL
-                );
-            """)
-            # garantias adicionais (caso tabela exista antiga)
-            cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;")
-            cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS source TEXT NULL;")
-            cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS payload JSONB;")
-
-            # EVENTS
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.vitals_events (
-                    id BIGSERIAL PRIMARY KEY,
-                    event_key TEXT UNIQUE,
-                    cod_atendimento INT NOT NULL,
-                    id_ricadpac INT NULL,
-                    event_ts TIMESTAMP NOT NULL,
-                    hora INT NULL,
-                    minuto INT NULL,
-                    temp DOUBLE PRECISION NULL,
-                    pas INT NULL,
-                    pad INT NULL,
-                    fc INT NULL,
-                    fr INT NULL,
-                    spo2 INT NULL,
-                    dor TEXT NULL,
-                    uso_o2 TEXT NULL,
-                    nivel_consciencia TEXT NULL,
-                    profissional TEXT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_vitals_events_ts ON public.vitals_events (event_ts DESC);")
-
-            # RECOMMENDATIONS (se você já tem outra tabela, essa aqui não atrapalha)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
-                    id BIGSERIAL PRIMARY KEY,
-                    cod_atendimento INT NOT NULL,
-                    snapshot_ts TIMESTAMP NOT NULL,
-                    recommendation_level TEXT NOT NULL,
-                    syndrome TEXT NULL,
-                    confidence DOUBLE PRECISION NULL,
-                    actions TEXT NULL,
-                    notified_at TIMESTAMP NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);")
-        conn.commit()
-
-
-def ensure_schema_with_retry(max_seconds: int = 45) -> bool:
+def ensure_schema_with_retry(max_seconds: int = 30) -> bool:
     start = time.time()
     wait = 1.0
     last_err = None
     while time.time() - start < max_seconds:
         try:
-            ensure_schema_once()
+            # Não altera schemas existentes agressivamente (evita conflito com seu banco)
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Só garante tabela de recommendations se não existir (não interfere se já existir a sua)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
+                            id BIGSERIAL PRIMARY KEY,
+                            cod_atendimento INT NOT NULL,
+                            snapshot_ts TIMESTAMP NOT NULL,
+                            recommendation_level TEXT NOT NULL,
+                            syndrome TEXT NULL,
+                            confidence DOUBLE PRECISION NULL,
+                            actions TEXT NULL,
+                            notified_at TIMESTAMP NULL,
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);")
+                conn.commit()
             return True
         except Exception as e:
             last_err = e
             print(f"[WARN] DB ainda não pronto: {e}", flush=True)
             time.sleep(wait)
             wait = min(wait * 1.7, 6.0)
+
     print(f"[WARN] DB não ficou pronto no startup. Último erro: {last_err}", flush=True)
     return False
 
@@ -172,8 +122,52 @@ def _startup():
     ensure_schema_with_retry()
 
 
+def get_table_columns(table: str) -> List[Dict[str, Any]]:
+    """
+    Retorna colunas do schema public.<table>
+    """
+    schema = "public"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    column_name,
+                    is_nullable,
+                    data_type,
+                    column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position;
+            """, (schema, table))
+            rows = cur.fetchall()
+            return rows or []
+
+
+def build_insert(table: str, row_values: Dict[str, Any]) -> Tuple[str, List[Any]]:
+    """
+    Monta INSERT dinâmico só com colunas que existem na tabela.
+    """
+    cols_meta = get_table_columns(table)
+    existing = {c["column_name"] for c in cols_meta}
+    cols = []
+    vals = []
+    for k, v in row_values.items():
+        if k in existing:
+            cols.append(k)
+            vals.append(v)
+
+    if not cols:
+        raise RuntimeError(f"Nenhuma coluna compatível encontrada para inserir em {table}")
+
+    placeholders = ", ".join(["%s"] * len(cols))
+    col_list = ", ".join(cols)
+    sql = f"INSERT INTO public.{table} ({col_list}) VALUES ({placeholders});"
+    return sql, vals
+
+
 # ---------------------------
-# Normalização PowerBI
+# Normalização
 # ---------------------------
 class VitalRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -209,7 +203,7 @@ def _to_int(v):
     if v is None or v == "":
         return None
     try:
-        return int(v)
+        return int(float(v))
     except Exception:
         return None
 
@@ -294,7 +288,7 @@ def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
                 continue
 
             payload = {
-                "cod_atendimento": int(cod),
+                "cod_atendimento": int(float(cod)),
                 "id_ricadpac": _to_int(_pick(r, "ID_RICADPAC", "id_ricadpac", "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]", "[ID_RICADPAC]")),
                 "event_ts": _parse_event_ts(r),
 
@@ -421,54 +415,88 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
 
 
 def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
-    ensure_schema_once()
-
     raw_inserted = 0
-    events_upserted = 0
+    events_inserted = 0
     critical_recs = 0
 
+    now = datetime.utcnow()
     raw_obj = raw_payload if isinstance(raw_payload, dict) else {"payload": raw_payload}
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO public.vitals_raw (source, payload) VALUES (%s, %s::jsonb);",
-                ("power_automate", json.dumps(raw_obj)),
-            )
-            raw_inserted += 1
 
+            # 1) INSERT em vitals_raw: 1 linha POR VITAL (garante event_ts NOT NULL)
+            # Mapeia colunas comuns e insere só as que existirem na sua tabela.
             for r in rows:
-                event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
-                cur.execute("""
-                    INSERT INTO public.vitals_events (
-                        event_key, cod_atendimento, id_ricadpac, event_ts,
-                        hora, minuto, temp, pas, pad, fc, fr, spo2,
-                        dor, uso_o2, nivel_consciencia, profissional,
-                        updated_at
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
-                    ON CONFLICT (event_key) DO UPDATE SET
-                        id_ricadpac        = COALESCE(EXCLUDED.id_ricadpac, vitals_events.id_ricadpac),
-                        hora              = COALESCE(EXCLUDED.hora, vitals_events.hora),
-                        minuto            = COALESCE(EXCLUDED.minuto, vitals_events.minuto),
-                        temp              = COALESCE(EXCLUDED.temp, vitals_events.temp),
-                        pas               = COALESCE(EXCLUDED.pas, vitals_events.pas),
-                        pad               = COALESCE(EXCLUDED.pad, vitals_events.pad),
-                        fc                = COALESCE(EXCLUDED.fc, vitals_events.fc),
-                        fr                = COALESCE(EXCLUDED.fr, vitals_events.fr),
-                        spo2              = COALESCE(EXCLUDED.spo2, vitals_events.spo2),
-                        dor               = COALESCE(EXCLUDED.dor, vitals_events.dor),
-                        uso_o2            = COALESCE(EXCLUDED.uso_o2, vitals_events.uso_o2),
-                        nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_events.nivel_consciencia),
-                        profissional      = COALESCE(EXCLUDED.profissional, vitals_events.profissional),
-                        updated_at        = CURRENT_TIMESTAMP;
-                """, (
-                    event_key, r.cod_atendimento, r.id_ricadpac, r.event_ts,
-                    r.hora, r.minuto, r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
-                    r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
-                ))
-                events_upserted += 1
+                raw_row_values = {
+                    "event_ts": r.event_ts,
+                    "cod_atendimento": r.cod_atendimento,
+                    "id_ricadpac": r.id_ricadpac,
+                    "hora": r.hora,
+                    "minuto": r.minuto,
+                    "temp": r.temp,
+                    "pas": r.pas,
+                    "pad": r.pad,
+                    "fc": r.fc,
+                    "fr": r.fr,
+                    "spo2": r.spo2,
+                    "dor": r.dor,
+                    "uso_o2": r.uso_o2,
+                    "nivel_consciencia": r.nivel_consciencia,
+                    "profissional": r.profissional,
+                    "source": "power_automate",
+                    "received_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                    "payload": json.dumps(raw_obj),  # se existir coluna payload json/jsonb
+                }
 
+                sql, vals = build_insert("vitals_raw", raw_row_values)
+                cur.execute(sql, vals)
+                raw_inserted += 1
+
+            # 2) INSERT/UPSERT em vitals_events (se existir e for sua tabela final)
+            # Aqui eu faço UPSERT por event_key; se sua tabela não tiver event_key,
+            # ainda assim gravamos em vitals_raw e você me avisa o schema de vitals_events.
+            cols_events = {c["column_name"] for c in get_table_columns("vitals_events")}
+            has_event_key = "event_key" in cols_events
+
+            if has_event_key:
+                for r in rows:
+                    event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
+                    cur.execute("""
+                        INSERT INTO public.vitals_events (
+                            event_key, cod_atendimento, id_ricadpac, event_ts,
+                            hora, minuto, temp, pas, pad, fc, fr, spo2,
+                            dor, uso_o2, nivel_consciencia, profissional,
+                            updated_at
+                        )
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
+                        ON CONFLICT (event_key) DO UPDATE SET
+                            id_ricadpac        = COALESCE(EXCLUDED.id_ricadpac, vitals_events.id_ricadpac),
+                            hora              = COALESCE(EXCLUDED.hora, vitals_events.hora),
+                            minuto            = COALESCE(EXCLUDED.minuto, vitals_events.minuto),
+                            temp              = COALESCE(EXCLUDED.temp, vitals_events.temp),
+                            pas               = COALESCE(EXCLUDED.pas, vitals_events.pas),
+                            pad               = COALESCE(EXCLUDED.pad, vitals_events.pad),
+                            fc                = COALESCE(EXCLUDED.fc, vitals_events.fc),
+                            fr                = COALESCE(EXCLUDED.fr, vitals_events.fr),
+                            spo2              = COALESCE(EXCLUDED.spo2, vitals_events.spo2),
+                            dor               = COALESCE(EXCLUDED.dor, vitals_events.dor),
+                            uso_o2            = COALESCE(EXCLUDED.uso_o2, vitals_events.uso_o2),
+                            nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_events.nivel_consciencia),
+                            profissional      = COALESCE(EXCLUDED.profissional, vitals_events.profissional),
+                            updated_at        = CURRENT_TIMESTAMP;
+                    """, (
+                        event_key, r.cod_atendimento, r.id_ricadpac, r.event_ts,
+                        r.hora, r.minuto, r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
+                        r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
+                    ))
+                    events_inserted += 1
+            else:
+                print("[WARN] vitals_events existe mas não tem coluna event_key; pulando UPSERT para evitar erro.", flush=True)
+
+            # 3) Recommendations + Telegram
             recs = compute_recommendations(rows)
             for rec in recs:
                 cur.execute("""
@@ -497,7 +525,11 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
 
         conn.commit()
 
-    return {"raw_inserted": raw_inserted, "events_upserted": events_upserted, "critical_recommendations": critical_recs}
+    return {
+        "raw_inserted": raw_inserted,
+        "events_inserted": events_inserted,
+        "critical_recommendations": critical_recs
+    }
 
 
 # ---------------------------
@@ -505,7 +537,7 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
 # ---------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0.5"}
+    return {"status": "ok", "version": "4.0.6"}
 
 
 @app.get("/v1/db/ping")
@@ -515,7 +547,7 @@ def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
         with conn.cursor() as cur:
             cur.execute("SELECT 1 AS ok;")
             r = cur.fetchone()
-    return {"ok": True, "db": r["ok"], "version": "4.0.5"}
+    return {"ok": True, "db": r["ok"], "version": "4.0.6"}
 
 
 @app.post("/v1/vitals/batch")
@@ -543,7 +575,7 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
                     "top_keys": list(payload.keys())[:50] if isinstance(payload, dict) else None,
                     "row0_type": type(row0).__name__ if row0 is not None else None,
                     "row0_keys_sample": list(row0.keys())[:80] if isinstance(row0, dict) else None,
-                    "version": "4.0.5",
+                    "version": "4.0.6",
                 }
             }
 
@@ -555,12 +587,11 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
             "received": received,
             "normalized": normalized,
             "stats": stats,
-            "message": "Inserido no Neon (raw + events + recommendations). Telegram enviado quando crítico.",
-            "version": "4.0.5"
+            "message": "Gravou no Neon: vitals_raw por linha. Recommendations e Telegram para críticos.",
+            "version": "4.0.6"
         }
 
     except Exception as e:
-        # NÃO deixar 500 "cego": devolve motivo e onde quebrou
         err = str(e)
         tb = traceback.format_exc()
         print("[ERROR] /v1/vitals/batch crashed:", err, flush=True)
@@ -570,5 +601,5 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
             "ok": False,
             "error": err,
             "where": "/v1/vitals/batch",
-            "version": "4.0.5"
+            "version": "4.0.6"
         }
