@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import time
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -7,13 +9,13 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Body
-from pydantic import BaseModel, Field, ConfigDict
+from fastapi import FastAPI, HTTPException, Header, Body
+from pydantic import BaseModel, ConfigDict
 
 # ======================================================
 # APP
 # ======================================================
-app = FastAPI(title="PREVITA API", version="4.0.1")
+app = FastAPI(title="PREVITA API", version="4.0.2")
 
 # ======================================================
 # ENV
@@ -46,16 +48,14 @@ def send_telegram_message_sync(text: str):
         }
         requests.post(url, json=payload, timeout=12)
     except Exception as e:
-        print(f"[TELEGRAM] WARN: {e}")
+        print(f"[TELEGRAM] WARN: {e}", flush=True)
 
 # ======================================================
 # DB
 # ======================================================
 def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada")
-
-    # Neon pooler: NÃO usar options/statement_timeout (dá unsupported parameter).
+        raise RuntimeError("DATABASE_URL não configurada no Render")
     return psycopg.connect(
         DATABASE_URL,
         row_factory=dict_row,
@@ -63,13 +63,8 @@ def get_conn():
     )
 
 def ensure_schema_once():
-    """
-    Cria tabelas (se não existirem) e adiciona colunas faltantes.
-    Resolve: column received_at does not exist
-    """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # RAW
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_raw (
                     id BIGSERIAL PRIMARY KEY,
@@ -82,7 +77,6 @@ def ensure_schema_once():
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS source TEXT NULL;")
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS payload JSONB;")
 
-            # EVENTS
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -111,7 +105,6 @@ def ensure_schema_once():
                 ON public.vitals_events (event_ts DESC);
             """)
 
-            # RECOMMENDATIONS
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
                     id BIGSERIAL PRIMARY KEY,
@@ -142,10 +135,10 @@ def ensure_schema_with_retry(max_seconds: int = 45) -> bool:
             return True
         except Exception as e:
             last_err = e
-            print(f"[WARN] DB ainda não pronto: {e}")
+            print(f"[WARN] DB ainda não pronto: {e}", flush=True)
             time.sleep(wait)
             wait = min(wait * 1.7, 6.0)
-    print(f"[WARN] DB não ficou pronto no startup. Último erro: {last_err}")
+    print(f"[WARN] DB não ficou pronto no startup. Último erro: {last_err}", flush=True)
     return False
 
 @app.on_event("startup")
@@ -153,7 +146,7 @@ def _startup():
     ensure_schema_with_retry()
 
 # ======================================================
-# MODELS / NORMALIZAÇÃO
+# NORMALIZAÇÃO
 # ======================================================
 class VitalRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -161,7 +154,6 @@ class VitalRow(BaseModel):
     cod_atendimento: int
     id_ricadpac: Optional[int] = None
     event_ts: datetime
-
     hora: Optional[int] = None
     minuto: Optional[int] = None
     temp: Optional[float] = None
@@ -170,7 +162,6 @@ class VitalRow(BaseModel):
     fc: Optional[int] = None
     fr: Optional[int] = None
     spo2: Optional[int] = None
-
     dor: Optional[str] = None
     uso_o2: Optional[str] = None
     nivel_consciencia: Optional[str] = None
@@ -208,13 +199,11 @@ def _parse_dt_iso(v) -> Optional[datetime]:
         return None
 
 def _parse_event_ts(r: Dict[str, Any]) -> datetime:
-    # 1) pronto
     ev = _pick(r, "event_ts", "EVENT_TS")
     dt = _parse_dt_iso(ev)
     if dt:
         return dt.replace(second=0, microsecond=0)
 
-    # 2) DATA_HORA_LANC_MINUTO (pode vir 00:00)
     dh = _pick(r, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]")
     dl = _pick(r, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
     h  = _pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")
@@ -228,7 +217,6 @@ def _parse_event_ts(r: Dict[str, Any]) -> datetime:
                 return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
         return dt_dh.replace(second=0, microsecond=0)
 
-    # 3) fallback: DATA_LANC + HORA + MINUTO
     base = _parse_dt_iso(dl)
     if not base:
         raise ValueError("Sem DATA_LANC/DATE para construir event_ts")
@@ -263,26 +251,75 @@ def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
             }
             out.append(VitalRow(**payload))
         except Exception as e:
-            print(f"[WARN] Linha inválida ignorada: {e}")
+            print(f"[WARN] Linha inválida ignorada: {e}", flush=True)
     return out
 
 # ======================================================
-# EXTRATOR (Power Automate / PowerBI)
+# EXTRATOR (inclui payload achatado do Power Automate)
 # ======================================================
+_FLAT_RE = re.compile(
+    r"^(?:powerbi\.)?results\.(\d+)\.tables\.(\d+)\.rows\.(\d+)\.\[(.+?)\]$"
+)
+_FLAT_RE2 = re.compile(
+    r"^(?:powerbi\.)?results\.(\d+)\.tables\.(\d+)\.rows\.(\d+)\.(.+?)$"
+)
+
+def _try_json_load(v: Any) -> Any:
+    if isinstance(v, str):
+        s = v.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return v
+    return v
+
+def rebuild_rows_from_flat(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Constrói rows[] quando o Power Automate manda chaves achatadas:
+      powerbi.results.0.tables.0.rows.0.[COD_ATENDIMENTO]
+    """
+    rows_map: Dict[int, Dict[str, Any]] = {}
+
+    for k, v in payload.items():
+        if not isinstance(k, str):
+            continue
+
+        m = _FLAT_RE.match(k)
+        if m:
+            row_i = int(m.group(3))
+            field = m.group(4)
+            rows_map.setdefault(row_i, {})[field] = _try_json_load(v)
+            continue
+
+        m2 = _FLAT_RE2.match(k)
+        if m2:
+            row_i = int(m2.group(3))
+            field = m2.group(4)
+            rows_map.setdefault(row_i, {})[field] = _try_json_load(v)
+            continue
+
+    if not rows_map:
+        return []
+
+    return [rows_map[i] for i in sorted(rows_map.keys())]
+
 def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    # lista direta
+    payload = _try_json_load(payload)
+
     if isinstance(payload, list):
         return payload
 
     if not isinstance(payload, dict):
         return []
 
-    # {"rows":[...]}
+    # 1) formato direto {"rows":[...]}
     if isinstance(payload.get("rows"), list):
         return payload["rows"]
 
-    # {"powerbi": {...}}
+    # 2) formato { "powerbi": {body do PBI} }
     pb = payload.get("powerbi")
+    pb = _try_json_load(pb)
     if isinstance(pb, dict):
         try:
             rows = pb["results"][0]["tables"][0]["rows"]
@@ -291,7 +328,7 @@ def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    # body do PBI direto
+    # 3) formato body do PBI direto {results:[{tables:[{rows:[]}]}]}
     try:
         rows = payload["results"][0]["tables"][0]["rows"]
         if isinstance(rows, list):
@@ -299,10 +336,23 @@ def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
+    # 4) formato ACHATADO do Power Automate (principal causa do seu problema)
+    flat_rows = rebuild_rows_from_flat(payload)
+    if flat_rows:
+        return flat_rows
+
+    # 5) às vezes vem dentro de um campo único que é string JSON
+    for v in payload.values():
+        vv = _try_json_load(v)
+        if isinstance(vv, dict) or isinstance(vv, list):
+            rr = extract_rows_from_payload(vv)
+            if rr:
+                return rr
+
     return []
 
 # ======================================================
-# REGRAS DE CRITICIDADE (mínimas, operacionais)
+# CRITICIDADE
 # ======================================================
 def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     recs: List[Dict[str, Any]] = []
@@ -312,24 +362,19 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
         confidence = None
         actions = None
 
-        # Hipotensão: IMEDIATO
         if r.pas is not None and r.pas < 90:
             level = "IMEDIATO"
             syndrome = "Hipotensão"
             confidence = 0.85
             actions = "Checar PA manual, perfusão, sangramento/dor e acionar médico conforme protocolo."
-
-        # Hipoxemia: PRIORIDADE
         elif r.spo2 is not None and r.spo2 < 92:
             level = "PRIORIDADE"
             syndrome = "Hipoxemia"
             confidence = 0.70
             actions = "Reavaliar oximetria, verificar O2, checar desconforto respiratório e acionar protocolo."
-
-        # FC crítica: PRIORIDADE
         elif r.fc is not None and (r.fc >= 130 or r.fc <= 40):
             level = "PRIORIDADE"
-            syndrome = "Frequência cardíaca crítica"
+            syndrome = "FC crítica"
             confidence = 0.65
             actions = "Repetir sinais vitais, checar sintomas, ECG se disponível e acionar médico."
 
@@ -345,7 +390,7 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     return recs
 
 # ======================================================
-# PERSISTÊNCIA + TELEGRAM
+# PERSIST
 # ======================================================
 def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
     ensure_schema_once()
@@ -354,11 +399,7 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
     events_upserted = 0
     critical_recs = 0
 
-    # transforma raw em dict para jsonb
-    if isinstance(raw_payload, dict):
-        raw_obj = raw_payload
-    else:
-        raw_obj = {"payload": raw_payload}
+    raw_obj = raw_payload if isinstance(raw_payload, dict) else {"payload": raw_payload}
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -369,7 +410,7 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
             )
             raw_inserted += 1
 
-            # EVENTS (upsert merge)
+            # EVENTS
             for r in rows:
                 event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
                 cur.execute("""
@@ -453,53 +494,43 @@ def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
             r = cur.fetchone()
     return {"ok": True, "db": r["ok"]}
 
-@app.get("/v1/vitals/last_event_ts")
-def last_event_ts(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
-    _check_key(x_api_key)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT MAX(event_ts) AS last_ts FROM public.vitals_events;")
-            row = cur.fetchone()
-    last_ts = row["last_ts"] if row else None
-    return {"last_event_ts": last_ts.isoformat() if last_ts else "1970-01-01T00:00:00"}
-
-# ✅ AQUI está o ajuste que resolve seu 422:
-# payload é FORÇADO como BODY do request
 @app.post("/v1/vitals/batch")
 def vitals_batch(
-    background: BackgroundTasks,
     payload: Any = Body(...),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
 
+    # extrai rows mesmo se vier achatado
     rows_raw = extract_rows_from_payload(payload)
     received = len(rows_raw)
 
     vitals = normalize_powerbi_rows(rows_raw)
     normalized = len(vitals)
 
-    def _job():
-        try:
-            stats = persist_all(raw_payload=payload, rows=vitals)
-            print(f"[INGEST] OK received={received} normalized={normalized} stats={stats}")
-        except Exception as e:
-            print(f"[INGEST] ERROR: {e}")
+    print(f"[INGEST] received_rows={received} normalized={normalized}", flush=True)
 
-    if normalized > 0:
-        background.add_task(_job)
+    if normalized <= 0:
+        # devolve diagnóstico para o Power Automate
         return {
             "ok": True,
-            "queued": True,
+            "queued": False,
             "received": received,
-            "normalized": normalized,
-            "message": "Processando em background (raw + events + critical recs + telegram)"
+            "normalized": 0,
+            "message": "Nenhuma linha passou na normalização. Provável payload achatado/sem COD_ATENDIMENTO/DATA_LANC. (Agora a API tenta reconstruir rows, mas verifique campos.)",
         }
 
-    return {
-        "ok": True,
-        "queued": False,
-        "received": received,
-        "normalized": 0,
-        "message": "Nenhuma linha passou na normalização. Verifique se COD_ATENDIMENTO/DATA_LANC existem no PowerBI."
-    }
+    try:
+        stats = persist_all(raw_payload=payload, rows=vitals)
+        print(f"[INGEST] OK stats={stats}", flush=True)
+        return {
+            "ok": True,
+            "queued": False,
+            "received": received,
+            "normalized": normalized,
+            "stats": stats,
+            "message": "Inserido no Neon (raw + events + recommendations) e telegram enviado quando crítico.",
+        }
+    except Exception as e:
+        print(f"[INGEST] ERROR: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
