@@ -1,9 +1,10 @@
 import os
-import re
 import json
 import time
+import traceback
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 import psycopg
@@ -12,7 +13,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Body
 from pydantic import BaseModel, ConfigDict
 
-app = FastAPI(title="PREVITA API", version="4.0.4")
+app = FastAPI(title="PREVITA API", version="4.0.5")
 
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
@@ -20,11 +21,17 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
+# ---------------------------
+# Segurança / Autenticação
+# ---------------------------
 def _check_key(x_api_key: Optional[str]):
     if ALERT_API_KEY and x_api_key != ALERT_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+# ---------------------------
+# Telegram
+# ---------------------------
 def send_telegram_message_sync(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -41,15 +48,50 @@ def send_telegram_message_sync(text: str):
         print(f"[TELEGRAM] WARN: {e}", flush=True)
 
 
+# ---------------------------
+# DB helpers
+# ---------------------------
+def _sanitize_db_url(url: str) -> str:
+    """
+    Evita parâmetros que costumam causar erro no pooler do Neon.
+    Mantém sslmode/channel_binding, remove options e similares.
+    """
+    if not url:
+        return url
+
+    p = urlparse(url)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+
+    # remove parâmetros que podem virar startup parameter/option
+    # (e causar 500)
+    for bad in ["options", "statement_timeout", "idle_in_transaction_session_timeout"]:
+        if bad in q:
+            q.pop(bad, None)
+
+    new_query = urlencode(q, doseq=True)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
+
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada no Render")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=12)
+
+    url = _sanitize_db_url(DATABASE_URL)
+
+    # Força options="" para anular PGOPTIONS do ambiente
+    # (isso elimina vários 'unsupported startup parameter')
+    return psycopg.connect(
+        url,
+        row_factory=dict_row,
+        connect_timeout=12,
+        options="",   # <- crítico para Neon pooler
+    )
 
 
 def ensure_schema_once():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # RAW
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_raw (
                     id BIGSERIAL PRIMARY KEY,
@@ -58,10 +100,12 @@ def ensure_schema_once():
                     payload JSONB NOT NULL
                 );
             """)
+            # garantias adicionais (caso tabela exista antiga)
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;")
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS source TEXT NULL;")
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS payload JSONB;")
 
+            # EVENTS
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -87,6 +131,7 @@ def ensure_schema_once():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_vitals_events_ts ON public.vitals_events (event_ts DESC);")
 
+            # RECOMMENDATIONS (se você já tem outra tabela, essa aqui não atrapalha)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
                     id BIGSERIAL PRIMARY KEY,
@@ -127,6 +172,9 @@ def _startup():
     ensure_schema_with_retry()
 
 
+# ---------------------------
+# Normalização PowerBI
+# ---------------------------
 class VitalRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
     cod_atendimento: int
@@ -186,7 +234,6 @@ def _parse_dt_iso(v) -> Optional[datetime]:
 
 
 def _clean_key(k: str) -> str:
-    """Remove colchetes e espaços: '[COD_ATENDIMENTO]' -> 'COD_ATENDIMENTO'."""
     s = str(k).strip()
     if s.startswith("[") and s.endswith("]"):
         s = s[1:-1].strip()
@@ -194,12 +241,6 @@ def _clean_key(k: str) -> str:
 
 
 def _alias_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Cria aliases de chaves:
-    - remove colchetes
-    - mantém original e versão limpa
-    - adiciona versão UPPER
-    """
     out = dict(row)
     for k, v in list(row.items()):
         if not isinstance(k, str):
@@ -219,13 +260,11 @@ def _pick(d: Dict[str, Any], *keys: str):
 
 
 def _parse_event_ts(r: Dict[str, Any]) -> datetime:
-    # tenta achar DATETIME pronto
     ev = _pick(r, "event_ts", "EVENT_TS")
     dt = _parse_dt_iso(ev)
     if dt:
         return dt.replace(second=0, microsecond=0)
 
-    # tenta DATA_HORA_LANC_MINUTO
     dh = _pick(r, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]")
     dl = _pick(r, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
     h  = _pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")
@@ -248,15 +287,9 @@ def _parse_event_ts(r: Dict[str, Any]) -> datetime:
 def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
     out: List[VitalRow] = []
     for rr in rows:
-        r = _alias_row_keys(rr)  # ✅ limpa colchetes e cria aliases
+        r = _alias_row_keys(rr)
         try:
-            cod = _pick(
-                r,
-                "COD_ATENDIMENTO",
-                "cod_atendimento",
-                "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]",
-                "[COD_ATENDIMENTO]",
-            )
+            cod = _pick(r, "COD_ATENDIMENTO", "cod_atendimento", "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]", "[COD_ATENDIMENTO]")
             if cod is None:
                 continue
 
@@ -265,19 +298,19 @@ def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
                 "id_ricadpac": _to_int(_pick(r, "ID_RICADPAC", "id_ricadpac", "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]", "[ID_RICADPAC]")),
                 "event_ts": _parse_event_ts(r),
 
-                "hora": _to_int(_pick(r, "HORA_LANC", "hora_lanc", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]", "[HORA_LANC]")),
-                "minuto": _to_int(_pick(r, "MINUTO_LANC", "minuto_lanc", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]", "[MINUTO_LANC]")),
+                "hora": _to_int(_pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]", "[HORA_LANC]")),
+                "minuto": _to_int(_pick(r, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]", "[MINUTO_LANC]")),
 
-                "temp": _to_float(_pick(r, "TEMP", "temp", "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]", "[TEMP]")),
-                "dor": _pick(r, "DOR", "dor", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]", "[DOR]"),
-                "fr": _to_int(_pick(r, "FR", "fr", "VW_PREVITA_VITAIS_AGRUPADOS[FR]", "[FR]")),
-                "fc": _to_int(_pick(r, "FC", "fc", "VW_PREVITA_VITAIS_AGRUPADOS[FC]", "[FC]")),
-                "pad": _to_int(_pick(r, "PAD", "pad", "VW_PREVITA_VITAIS_AGRUPADOS[PAD]", "[PAD]")),
-                "pas": _to_int(_pick(r, "PAS", "pas", "VW_PREVITA_VITAIS_AGRUPADOS[PAS]", "[PAS]")),
-                "spo2": _to_int(_pick(r, "SPO2", "spo2", "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]", "[SPO2]")),
-                "uso_o2": _pick(r, "USO_O2", "uso_o2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]", "[USO_O2]"),
-                "nivel_consciencia": _pick(r, "NIVEL_CONSCIENCIA", "nivel_consciencia", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]", "[NIVEL_CONSCIENCIA]"),
-                "profissional": _pick(r, "PROFISSIONAL", "profissional", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]", "[PROFISSIONAL]"),
+                "temp": _to_float(_pick(r, "TEMP", "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]", "[TEMP]")),
+                "dor": _pick(r, "DOR", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]", "[DOR]"),
+                "fr": _to_int(_pick(r, "FR", "VW_PREVITA_VITAIS_AGRUPADOS[FR]", "[FR]")),
+                "fc": _to_int(_pick(r, "FC", "VW_PREVITA_VITAIS_AGRUPADOS[FC]", "[FC]")),
+                "pad": _to_int(_pick(r, "PAD", "VW_PREVITA_VITAIS_AGRUPADOS[PAD]", "[PAD]")),
+                "pas": _to_int(_pick(r, "PAS", "VW_PREVITA_VITAIS_AGRUPADOS[PAS]", "[PAS]")),
+                "spo2": _to_int(_pick(r, "SPO2", "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]", "[SPO2]")),
+                "uso_o2": _pick(r, "USO_O2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]", "[USO_O2]"),
+                "nivel_consciencia": _pick(r, "NIVEL_CONSCIENCIA", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]", "[NIVEL_CONSCIENCIA]"),
+                "profissional": _pick(r, "PROFISSIONAL", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]", "[PROFISSIONAL]"),
             }
             out.append(VitalRow(**payload))
         except Exception as e:
@@ -286,11 +319,6 @@ def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
 
 
 def _extract_tables_struct(pb: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, Any]], List[Any]]]:
-    """
-    Retorna (columns, rows) se encontrar em results[0].tables[0].
-    columns: lista de dicts com "name"
-    rows: lista (pode ser lista de dict ou lista de list)
-    """
     try:
         tables = pb["results"][0]["tables"]
         if not tables:
@@ -306,27 +334,13 @@ def _extract_tables_struct(pb: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, 
 
 
 def _rows_list_to_dicts(columns: List[Dict[str, Any]], rows: List[Any]) -> List[Dict[str, Any]]:
-    """
-    Se rows vier como lista de listas, converte usando columns[].name.
-    """
     if not rows:
         return []
-
-    # se já é lista de dict, devolve direto
     if isinstance(rows[0], dict):
         return rows  # type: ignore
-
-    # se não tem columns, não dá pra mapear com segurança
     if not columns or not isinstance(rows[0], list):
         return []
-
-    names = []
-    for c in columns:
-        nm = c.get("name")
-        if nm is None:
-            nm = ""
-        names.append(str(nm))
-
+    names = [str(c.get("name") or "") for c in columns]
     out: List[Dict[str, Any]] = []
     for arr in rows:
         if not isinstance(arr, list):
@@ -352,8 +366,6 @@ def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
             mapped = _rows_list_to_dicts(cols, rows)
             if mapped:
                 return mapped
-
-        # fallback clássico: rows já como dicts (sem columns)
         try:
             rows = pb["results"][0]["tables"][0]["rows"]
             if isinstance(rows, list) and rows and isinstance(rows[0], dict):
@@ -361,7 +373,6 @@ def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    # fallback: se vier direto sem "powerbi"
     if isinstance(payload.get("rows"), list):
         rr = payload["rows"]
         if rr and isinstance(rr[0], dict):
@@ -370,6 +381,9 @@ def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+# ---------------------------
+# Regras críticas + Persistência
+# ---------------------------
 def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     recs: List[Dict[str, Any]] = []
     for r in rows:
@@ -419,7 +433,7 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO public.vitals_raw (source, payload) VALUES (%s, %s::jsonb);",
-                ("power_automate", psycopg.types.json.Json(raw_obj)),
+                ("power_automate", json.dumps(raw_obj)),
             )
             raw_inserted += 1
 
@@ -486,9 +500,12 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
     return {"raw_inserted": raw_inserted, "events_upserted": events_upserted, "critical_recommendations": critical_recs}
 
 
+# ---------------------------
+# Rotas
+# ---------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "4.0.5"}
 
 
 @app.get("/v1/db/ping")
@@ -498,58 +515,60 @@ def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
         with conn.cursor() as cur:
             cur.execute("SELECT 1 AS ok;")
             r = cur.fetchone()
-    return {"ok": True, "db": r["ok"]}
+    return {"ok": True, "db": r["ok"], "version": "4.0.5"}
 
 
 @app.post("/v1/vitals/batch")
 def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
     _check_key(x_api_key)
 
-    rows_raw = extract_rows_from_payload(payload)
-    received = len(rows_raw)
+    try:
+        rows_raw = extract_rows_from_payload(payload)
+        received = len(rows_raw)
 
-    vitals = normalize_powerbi_rows(rows_raw)
-    normalized = len(vitals)
+        vitals = normalize_powerbi_rows(rows_raw)
+        normalized = len(vitals)
 
-    print(f"[INGEST] received_rows={received} normalized={normalized}", flush=True)
+        print(f"[INGEST] received_rows={received} normalized={normalized}", flush=True)
 
-    if normalized <= 0:
-        # DEBUG: tipo e chaves do 1º row
-        row0 = rows_raw[0] if rows_raw else None
-        row0_type = type(row0).__name__ if row0 is not None else None
-        row0_keys = None
-        if isinstance(row0, dict):
-            row0_keys = list(row0.keys())[:80]
+        if normalized <= 0:
+            row0 = rows_raw[0] if rows_raw else None
+            return {
+                "ok": True,
+                "queued": False,
+                "received": received,
+                "normalized": 0,
+                "message": "Nenhuma linha passou na normalização. COD_ATENDIMENTO não foi encontrado no formato retornado.",
+                "debug": {
+                    "top_keys": list(payload.keys())[:50] if isinstance(payload, dict) else None,
+                    "row0_type": type(row0).__name__ if row0 is not None else None,
+                    "row0_keys_sample": list(row0.keys())[:80] if isinstance(row0, dict) else None,
+                    "version": "4.0.5",
+                }
+            }
 
-        pb = None
-        pb_keys = None
-        if isinstance(payload, dict):
-            pb = _try_json_load(payload.get("powerbi"))
-            if isinstance(pb, dict):
-                pb_keys = list(pb.keys())[:60]
+        stats = persist_all(raw_payload=payload, rows=vitals)
 
         return {
             "ok": True,
             "queued": False,
             "received": received,
-            "normalized": 0,
-            "message": "Nenhuma linha passou na normalização. COD_ATENDIMENTO não foi encontrado no formato retornado.",
-            "debug": {
-                "top_keys": list(payload.keys())[:50] if isinstance(payload, dict) else None,
-                "powerbi_keys": pb_keys,
-                "row0_type": row0_type,
-                "row0_keys_sample": row0_keys,
-            }
+            "normalized": normalized,
+            "stats": stats,
+            "message": "Inserido no Neon (raw + events + recommendations). Telegram enviado quando crítico.",
+            "version": "4.0.5"
         }
 
-    stats = persist_all(raw_payload=payload, rows=vitals)
-    print(f"[INGEST] OK stats={stats}", flush=True)
+    except Exception as e:
+        # NÃO deixar 500 "cego": devolve motivo e onde quebrou
+        err = str(e)
+        tb = traceback.format_exc()
+        print("[ERROR] /v1/vitals/batch crashed:", err, flush=True)
+        print(tb, flush=True)
 
-    return {
-        "ok": True,
-        "queued": False,
-        "received": received,
-        "normalized": normalized,
-        "stats": stats,
-        "message": "Inserido no Neon (raw + events + recommendations). Telegram enviado quando crítico.",
-    }
+        return {
+            "ok": False,
+            "error": err,
+            "where": "/v1/vitals/batch",
+            "version": "4.0.5"
+        }
