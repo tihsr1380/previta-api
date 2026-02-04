@@ -7,13 +7,13 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Body
 from pydantic import BaseModel, Field, ConfigDict
 
 # ======================================================
 # APP
 # ======================================================
-app = FastAPI(title="PREVITA API", version="4.0.0")
+app = FastAPI(title="PREVITA API", version="4.0.1")
 
 # ======================================================
 # ENV
@@ -53,10 +53,9 @@ def send_telegram_message_sync(text: str):
 # ======================================================
 def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada no Render")
+        raise RuntimeError("DATABASE_URL não configurada")
 
-    # Neon pooler não aceita alguns startup params (statement_timeout via options).
-    # Então usamos apenas connect_timeout.
+    # Neon pooler: NÃO usar options/statement_timeout (dá unsupported parameter).
     return psycopg.connect(
         DATABASE_URL,
         row_factory=dict_row,
@@ -65,12 +64,12 @@ def get_conn():
 
 def ensure_schema_once():
     """
-    Cria tabelas se não existirem e adiciona colunas que possam faltar
-    (resolve 'column received_at does not exist').
+    Cria tabelas (se não existirem) e adiciona colunas faltantes.
+    Resolve: column received_at does not exist
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # RAW (json bruto) - não perde nada
+            # RAW
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_raw (
                     id BIGSERIAL PRIMARY KEY,
@@ -79,12 +78,11 @@ def ensure_schema_once():
                     payload JSONB NOT NULL
                 );
             """)
-            # se a tabela já existe mas sem coluna, adiciona
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;")
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS source TEXT NULL;")
             cur.execute("ALTER TABLE public.vitals_raw ADD COLUMN IF NOT EXISTS payload JSONB;")
 
-            # EVENTS normalizado
+            # EVENTS
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.vitals_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -113,7 +111,7 @@ def ensure_schema_once():
                 ON public.vitals_events (event_ts DESC);
             """)
 
-            # recomendações (se já existir, não mexe)
+            # RECOMMENDATIONS
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
                     id BIGSERIAL PRIMARY KEY,
@@ -155,7 +153,7 @@ def _startup():
     ensure_schema_with_retry()
 
 # ======================================================
-# NORMALIZAÇÃO
+# MODELS / NORMALIZAÇÃO
 # ======================================================
 class VitalRow(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -210,13 +208,13 @@ def _parse_dt_iso(v) -> Optional[datetime]:
         return None
 
 def _parse_event_ts(r: Dict[str, Any]) -> datetime:
-    # 1) se já vier pronto
+    # 1) pronto
     ev = _pick(r, "event_ts", "EVENT_TS")
     dt = _parse_dt_iso(ev)
     if dt:
         return dt.replace(second=0, microsecond=0)
 
-    # 2) DATA_HORA_LANC_MINUTO (às vezes vem 00:00:00 errado)
+    # 2) DATA_HORA_LANC_MINUTO (pode vir 00:00)
     dh = _pick(r, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]")
     dl = _pick(r, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
     h  = _pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")
@@ -224,14 +222,13 @@ def _parse_event_ts(r: Dict[str, Any]) -> datetime:
 
     dt_dh = _parse_dt_iso(dh)
     if dt_dh:
-        # se vier zerado mas temos hora/minuto + data_lanc => reconstrói
         if dt_dh.hour == 0 and dt_dh.minute == 0 and dl is not None:
             base = _parse_dt_iso(dl)
             if base:
                 return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
         return dt_dh.replace(second=0, microsecond=0)
 
-    # 3) fallback: DATA_LANC + HORA_LANC + MINUTO_LANC
+    # 3) fallback: DATA_LANC + HORA + MINUTO
     base = _parse_dt_iso(dl)
     if not base:
         raise ValueError("Sem DATA_LANC/DATE para construir event_ts")
@@ -270,7 +267,42 @@ def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
     return out
 
 # ======================================================
-# REGRAS DE CRITICIDADE (v1 simples, mas funcional)
+# EXTRATOR (Power Automate / PowerBI)
+# ======================================================
+def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    # lista direta
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
+        return []
+
+    # {"rows":[...]}
+    if isinstance(payload.get("rows"), list):
+        return payload["rows"]
+
+    # {"powerbi": {...}}
+    pb = payload.get("powerbi")
+    if isinstance(pb, dict):
+        try:
+            rows = pb["results"][0]["tables"][0]["rows"]
+            if isinstance(rows, list):
+                return rows
+        except Exception:
+            pass
+
+    # body do PBI direto
+    try:
+        rows = payload["results"][0]["tables"][0]["rows"]
+        if isinstance(rows, list):
+            return rows
+    except Exception:
+        pass
+
+    return []
+
+# ======================================================
+# REGRAS DE CRITICIDADE (mínimas, operacionais)
 # ======================================================
 def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     recs: List[Dict[str, Any]] = []
@@ -280,19 +312,21 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
         confidence = None
         actions = None
 
-        # regras mínimas (você pode evoluir depois)
+        # Hipotensão: IMEDIATO
         if r.pas is not None and r.pas < 90:
             level = "IMEDIATO"
             syndrome = "Hipotensão"
             confidence = 0.85
             actions = "Checar PA manual, perfusão, sangramento/dor e acionar médico conforme protocolo."
 
+        # Hipoxemia: PRIORIDADE
         elif r.spo2 is not None and r.spo2 < 92:
             level = "PRIORIDADE"
             syndrome = "Hipoxemia"
             confidence = 0.70
             actions = "Reavaliar oximetria, verificar O2, checar desconforto respiratório e acionar protocolo."
 
+        # FC crítica: PRIORIDADE
         elif r.fc is not None and (r.fc >= 130 or r.fc <= 40):
             level = "PRIORIDADE"
             syndrome = "Frequência cardíaca crítica"
@@ -311,31 +345,31 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     return recs
 
 # ======================================================
-# PERSISTÊNCIA
+# PERSISTÊNCIA + TELEGRAM
 # ======================================================
-def persist_all(raw_payload: Dict[str, Any], rows: List[VitalRow]) -> Dict[str, Any]:
-    """
-    1) grava raw JSONB
-    2) grava events (upsert merge)
-    3) grava recomendações críticas
-    4) envia telegram para IMEDIATO/PRIORIDADE
-    """
+def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
     ensure_schema_once()
 
-    inserted_events = 0
-    inserted_raw = 0
-    inserted_recs = 0
+    raw_inserted = 0
+    events_upserted = 0
+    critical_recs = 0
+
+    # transforma raw em dict para jsonb
+    if isinstance(raw_payload, dict):
+        raw_obj = raw_payload
+    else:
+        raw_obj = {"payload": raw_payload}
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # raw
+            # RAW
             cur.execute(
                 "INSERT INTO public.vitals_raw (source, payload) VALUES (%s, %s::jsonb);",
-                ("power_automate", psycopg.types.json.Json(raw_payload)),
+                ("power_automate", psycopg.types.json.Json(raw_obj)),
             )
-            inserted_raw += 1
+            raw_inserted += 1
 
-            # events
+            # EVENTS (upsert merge)
             for r in rows:
                 event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
                 cur.execute("""
@@ -366,9 +400,9 @@ def persist_all(raw_payload: Dict[str, Any], rows: List[VitalRow]) -> Dict[str, 
                     r.hora, r.minuto, r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
                     r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
                 ))
-                inserted_events += 1
+                events_upserted += 1
 
-            # recomendações
+            # RECS + TELEGRAM
             recs = compute_recommendations(rows)
             for rec in recs:
                 cur.execute("""
@@ -383,9 +417,8 @@ def persist_all(raw_payload: Dict[str, Any], rows: List[VitalRow]) -> Dict[str, 
                     rec.get("confidence"),
                     rec.get("actions"),
                 ))
-                inserted_recs += 1
+                critical_recs += 1
 
-                # telegram imediato/prioridade
                 msg = (
                     f"🚨 <b>PREVITA – ALERTA {rec['recommendation_level']}</b>\n\n"
                     f"🧾 <b>Atendimento:</b> {rec['cod_atendimento']}\n"
@@ -399,48 +432,10 @@ def persist_all(raw_payload: Dict[str, Any], rows: List[VitalRow]) -> Dict[str, 
         conn.commit()
 
     return {
-        "raw_inserted": inserted_raw,
-        "events_upserted": inserted_events,
-        "critical_recommendations": inserted_recs,
+        "raw_inserted": raw_inserted,
+        "events_upserted": events_upserted,
+        "critical_recommendations": critical_recs,
     }
-
-# ======================================================
-# EXTRAÇÃO ROBUSTA DO PAYLOAD (POWER AUTOMATE)
-# ======================================================
-def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Aceita vários formatos e sempre tenta achar o array de rows.
-    """
-    # 1) lista direta
-    if isinstance(payload, list):
-        return payload
-
-    if not isinstance(payload, dict):
-        return []
-
-    # 2) {"rows":[...]}
-    if isinstance(payload.get("rows"), list):
-        return payload["rows"]
-
-    # 3) {"powerbi": <body do PBI>}
-    pb = payload.get("powerbi")
-    if isinstance(pb, dict):
-        try:
-            rows = pb["results"][0]["tables"][0]["rows"]
-            if isinstance(rows, list):
-                return rows
-        except Exception:
-            pass
-
-    # 4) body do PBI direto (sem wrapper)
-    try:
-        rows = payload["results"][0]["tables"][0]["rows"]
-        if isinstance(rows, list):
-            return rows
-    except Exception:
-        pass
-
-    return []
 
 # ======================================================
 # ENDPOINTS
@@ -468,31 +463,25 @@ def last_event_ts(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
     last_ts = row["last_ts"] if row else None
     return {"last_event_ts": last_ts.isoformat() if last_ts else "1970-01-01T00:00:00"}
 
+# ✅ AQUI está o ajuste que resolve seu 422:
+# payload é FORÇADO como BODY do request
 @app.post("/v1/vitals/batch")
 def vitals_batch(
-    payload: Any,
     background: BackgroundTasks,
+    payload: Any = Body(...),
     x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
 ):
     _check_key(x_api_key)
 
     rows_raw = extract_rows_from_payload(payload)
-
     received = len(rows_raw)
-    preview = min(received, 50)
 
-    # normaliza para o formato interno
     vitals = normalize_powerbi_rows(rows_raw)
     normalized = len(vitals)
 
-    # responde rápido para o Power Automate
-    # e processa em background
     def _job():
         try:
-            stats = persist_all(
-                raw_payload=payload if isinstance(payload, dict) else {"payload": payload},
-                rows=vitals
-            )
+            stats = persist_all(raw_payload=payload, rows=vitals)
             print(f"[INGEST] OK received={received} normalized={normalized} stats={stats}")
         except Exception as e:
             print(f"[INGEST] ERROR: {e}")
@@ -504,7 +493,6 @@ def vitals_batch(
             "queued": True,
             "received": received,
             "normalized": normalized,
-            "received_preview": preview,
             "message": "Processando em background (raw + events + critical recs + telegram)"
         }
 
@@ -513,6 +501,5 @@ def vitals_batch(
         "queued": False,
         "received": received,
         "normalized": 0,
-        "received_preview": preview,
-        "message": "Nenhuma linha passou na normalização (verifique campos COD_ATENDIMENTO/DATA_LANC etc.)"
+        "message": "Nenhuma linha passou na normalização. Verifique se COD_ATENDIMENTO/DATA_LANC existem no PowerBI."
     }
