@@ -728,3 +728,4 @@ async def vitals_batch(req: Request):
             },
         )
 
+
