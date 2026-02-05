@@ -10,6 +10,29 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import re
+
+def canonical_key(k: str) -> str:
+    if k is None:
+        return ""
+    k = str(k).strip()
+
+    # Se vier "Tabela[COLUNA]" pega a parte COLUNA
+    m = re.findall(r"\[([^\]]+)\]", k)
+    if m:
+        k = m[-1]  # pega o último [ ... ]
+
+    # Remove colchetes soltos e espaços
+    k = k.replace("[", "").replace("]", "").strip()
+
+    # Padroniza
+    return k.upper()
+
+def normalize_row_keys(row: dict) -> dict:
+    out = {}
+    for k, v in (row or {}).items():
+        out[canonical_key(k)] = v
+    return out
 
 
 APP_VERSION = "4.1.0"
@@ -704,3 +727,4 @@ async def vitals_batch(req: Request):
                 "version": APP_VERSION,
             },
         )
+
