@@ -13,7 +13,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, HTTPException, Header, Body
 from pydantic import BaseModel, ConfigDict
 
-app = FastAPI(title="PREVITA API", version="4.0.7")
+app = FastAPI(title="PREVITA API", version="4.0.8")
 
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
@@ -47,6 +47,7 @@ def _sanitize_db_url(url: str) -> str:
         return url
     p = urlparse(url)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
+    # remove parâmetros problemáticos para pooler/Neon
     for bad in ["options", "statement_timeout", "idle_in_transaction_session_timeout"]:
         q.pop(bad, None)
     new_query = urlencode(q, doseq=True)
@@ -386,28 +387,91 @@ def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
     return recs
 
 
+def upsert_vitals_events(cur, cols_events: set, r: VitalRow):
+    # obrigatórios para o nosso event_key
+    if "event_key" not in cols_events:
+        print("[WARN] vitals_events não tem event_key; pulando UPSERT.", flush=True)
+        return False
+
+    event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
+
+    # valores possíveis
+    candidate = {
+        "event_key": event_key,
+        "cod_atendimento": r.cod_atendimento,
+        "id_ricadpac": r.id_ricadpac,
+        "event_ts": r.event_ts,
+
+        # só entra se existir na tabela:
+        "data_lanc": r.data_lanc,
+        "temp": r.temp,
+        "pas": r.pas,
+        "pad": r.pad,
+        "fc": r.fc,
+        "fr": r.fr,
+        "spo2": r.spo2,
+        "dor": r.dor,
+        "uso_o2": r.uso_o2,
+        "nivel_consciencia": r.nivel_consciencia,
+        "profissional": r.profissional,
+    }
+
+    # filtra apenas colunas existentes
+    insert_cols = [k for k in candidate.keys() if k in cols_events]
+    insert_vals = [candidate[k] for k in insert_cols]
+
+    # updated_at (se existir) sempre atualiza
+    if "updated_at" in cols_events:
+        insert_cols.append("updated_at")
+        insert_vals.append(datetime.utcnow())
+
+    # monta INSERT
+    cols_sql = ", ".join(insert_cols)
+    ph_sql = ", ".join(["%s"] * len(insert_cols))
+
+    # monta UPDATE SET dinamicamente (não atualiza chaves)
+    updatable = [c for c in insert_cols if c not in ("event_key", "cod_atendimento")]
+    set_parts = []
+    for c in updatable:
+        if c == "updated_at":
+            set_parts.append("updated_at = CURRENT_TIMESTAMP")
+        else:
+            set_parts.append(f"{c} = COALESCE(EXCLUDED.{c}, vitals_events.{c})")
+
+    set_sql = ", ".join(set_parts) if set_parts else "updated_at = CURRENT_TIMESTAMP"
+
+    sql = f"""
+        INSERT INTO public.vitals_events ({cols_sql})
+        VALUES ({ph_sql})
+        ON CONFLICT (event_key) DO UPDATE SET
+            {set_sql};
+    """
+
+    cur.execute(sql, insert_vals)
+    return True
+
+
 def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
     raw_inserted = 0
-    events_inserted = 0
+    events_upserted = 0
     critical_recs = 0
 
     now = datetime.utcnow()
     raw_obj = raw_payload if isinstance(raw_payload, dict) else {"payload": raw_payload}
 
+    cols_events = {c["column_name"] for c in get_table_columns("vitals_events")}
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-
+            # 1) vitals_raw (schema-driven + data_lanc obrigatório)
             for r in rows:
                 raw_row_values = {
-                    # NOT NULL no seu banco:
                     "event_ts": r.event_ts,
                     "data_lanc": r.data_lanc,
 
-                    # comuns:
                     "cod_atendimento": r.cod_atendimento,
                     "id_ricadpac": r.id_ricadpac,
 
-                    # se existirem no schema:
                     "hora_lanc": r.hora,
                     "minuto_lanc": r.minuto,
 
@@ -436,42 +500,12 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
                 cur.execute(sql, vals)
                 raw_inserted += 1
 
-            cols_events = {c["column_name"] for c in get_table_columns("vitals_events")}
-            has_event_key = "event_key" in cols_events
+            # 2) vitals_events (UPSERT dinâmico SEM assumir data_lanc)
+            for r in rows:
+                if upsert_vitals_events(cur, cols_events, r):
+                    events_upserted += 1
 
-            if has_event_key:
-                for r in rows:
-                    event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
-                    cur.execute("""
-                        INSERT INTO public.vitals_events (
-                            event_key, cod_atendimento, id_ricadpac, event_ts, data_lanc,
-                            temp, pas, pad, fc, fr, spo2,
-                            dor, uso_o2, nivel_consciencia, profissional,
-                            updated_at
-                        )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP)
-                        ON CONFLICT (event_key) DO UPDATE SET
-                            id_ricadpac        = COALESCE(EXCLUDED.id_ricadpac, vitals_events.id_ricadpac),
-                            temp              = COALESCE(EXCLUDED.temp, vitals_events.temp),
-                            pas               = COALESCE(EXCLUDED.pas, vitals_events.pas),
-                            pad               = COALESCE(EXCLUDED.pad, vitals_events.pad),
-                            fc                = COALESCE(EXCLUDED.fc, vitals_events.fc),
-                            fr                = COALESCE(EXCLUDED.fr, vitals_events.fr),
-                            spo2              = COALESCE(EXCLUDED.spo2, vitals_events.spo2),
-                            dor               = COALESCE(EXCLUDED.dor, vitals_events.dor),
-                            uso_o2            = COALESCE(EXCLUDED.uso_o2, vitals_events.uso_o2),
-                            nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_events.nivel_consciencia),
-                            profissional      = COALESCE(EXCLUDED.profissional, vitals_events.profissional),
-                            updated_at        = CURRENT_TIMESTAMP;
-                    """, (
-                        event_key, r.cod_atendimento, r.id_ricadpac, r.event_ts, r.data_lanc,
-                        r.temp, r.pas, r.pad, r.fc, r.fr, r.spo2,
-                        r.dor, r.uso_o2, r.nivel_consciencia, r.profissional
-                    ))
-                    events_inserted += 1
-            else:
-                print("[WARN] vitals_events existe mas não tem coluna event_key; pulando UPSERT.", flush=True)
-
+            # 3) recomendações + Telegram
             recs = compute_recommendations(rows)
             for rec in recs:
                 cur.execute("""
@@ -502,14 +536,14 @@ def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
 
     return {
         "raw_inserted": raw_inserted,
-        "events_inserted": events_inserted,
+        "events_upserted": events_upserted,
         "critical_recommendations": critical_recs
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0.7"}
+    return {"status": "ok", "version": "4.0.8"}
 
 
 @app.get("/v1/db/ping")
@@ -519,7 +553,7 @@ def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
         with conn.cursor() as cur:
             cur.execute("SELECT 1 AS ok;")
             r = cur.fetchone()
-    return {"ok": True, "db": r["ok"], "version": "4.0.7"}
+    return {"ok": True, "db": r["ok"], "version": "4.0.8"}
 
 
 @app.post("/v1/vitals/batch")
@@ -545,7 +579,7 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
                     "top_keys": list(payload.keys())[:50] if isinstance(payload, dict) else None,
                     "row0_type": type(row0).__name__ if row0 is not None else None,
                     "row0_keys_sample": list(row0.keys())[:80] if isinstance(row0, dict) else None,
-                    "version": "4.0.7",
+                    "version": "4.0.8",
                 }
             }
 
@@ -557,8 +591,8 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
             "received": received,
             "normalized": normalized,
             "stats": stats,
-            "message": "Gravou no Neon com event_ts + data_lanc. Recommendations e Telegram para críticos.",
-            "version": "4.0.7"
+            "message": "Gravou vitals_raw (com data_lanc) e fez UPSERT em vitals_events conforme schema real. Recommendations + Telegram para críticos.",
+            "version": "4.0.8"
         }
 
     except Exception as e:
@@ -566,4 +600,4 @@ def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(Non
         tb = traceback.format_exc()
         print("[ERROR] /v1/vitals/batch crashed:", err, flush=True)
         print(tb, flush=True)
-        return {"ok": False, "error": err, "where": "/v1/vitals/batch", "version": "4.0.7"}
+        return {"ok": False, "error": err, "where": "/v1/vitals/batch", "version": "4.0.8"}
