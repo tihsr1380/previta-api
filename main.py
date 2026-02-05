@@ -1,603 +1,577 @@
 import os
 import json
-import time
-import traceback
-from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, date
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import re
+import logging
+from datetime import datetime, date, time
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import psycopg
-from psycopg.rows import dict_row
+from psycopg import sql
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, HTTPException, Header, Body
-from pydantic import BaseModel, ConfigDict
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("previta-api")
 
-app = FastAPI(title="PREVITA API", version="4.0.8")
+APP_VERSION = os.getenv("APP_VERSION", "4.1.0")
 
-DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
-ALERT_API_KEY = os.environ.get("ALERT_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-
-def _check_key(x_api_key: Optional[str]):
-    if ALERT_API_KEY and x_api_key != ALERT_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def send_telegram_message_sync(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        requests.post(url, json=payload, timeout=12)
-    except Exception as e:
-        print(f"[TELEGRAM] WARN: {e}", flush=True)
-
-
-def _sanitize_db_url(url: str) -> str:
+# -----------------------------------------------------------------------------
+# DB helpers
+# -----------------------------------------------------------------------------
+def _sanitize_database_url(url: str) -> str:
+    """
+    Remove parâmetros problemáticos (ex: options/statement_timeout) que alguns poolers podem rejeitar.
+    Mantém sslmode/channel_binding se estiverem presentes.
+    """
     if not url:
         return url
-    p = urlparse(url)
-    q = dict(parse_qsl(p.query, keep_blank_values=True))
-    # remove parâmetros problemáticos para pooler/Neon
-    for bad in ["options", "statement_timeout", "idle_in_transaction_session_timeout"]:
-        q.pop(bad, None)
-    new_query = urlencode(q, doseq=True)
-    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    # Remove parâmetros que podem quebrar poolers/pgbouncer
+    # Ex.: ...?sslmode=require&options=-c%20statement_timeout=...
+    url = re.sub(r"([?&])options=[^&]+", r"\1", url, flags=re.IGNORECASE)
+    url = re.sub(r"([?&])statement_timeout=[^&]+", r"\1", url, flags=re.IGNORECASE)
+    # limpa ?& ou && finais
+    url = url.replace("?&", "?").replace("&&", "&").rstrip("&").rstrip("?")
+    return url
 
+DATABASE_URL = _sanitize_database_url(os.getenv("DATABASE_URL", "").strip())
+SOURCE_NAME = os.getenv("SOURCE_NAME", "power_automate")
 
-def get_conn():
+if not DATABASE_URL:
+    log.warning("DATABASE_URL não definido. Configure no Render (Environment Variables).")
+
+def db_connect():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada no Render")
-    url = _sanitize_db_url(DATABASE_URL)
-    return psycopg.connect(
-        url,
-        row_factory=dict_row,
-        connect_timeout=12,
-        options="",  # anula PGOPTIONS do ambiente
-    )
+        raise RuntimeError("DATABASE_URL não configurado.")
+    # psycopg3
+    return psycopg.connect(DATABASE_URL)
 
+def get_table_columns(conn, table: str, schema: str = "public") -> List[str]:
+    q = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = %s AND table_name = %s
+    ORDER BY ordinal_position
+    """
+    rows = conn.execute(q, (schema, table)).fetchall()
+    return [r[0] for r in rows]
 
-def ensure_schema_with_retry(max_seconds: int = 30) -> bool:
-    start = time.time()
-    wait = 1.0
-    last_err = None
-    while time.time() - start < max_seconds:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.clinical_recommendations (
-                            id BIGSERIAL PRIMARY KEY,
-                            cod_atendimento INT NOT NULL,
-                            snapshot_ts TIMESTAMP NOT NULL,
-                            recommendation_level TEXT NOT NULL,
-                            syndrome TEXT NULL,
-                            confidence DOUBLE PRECISION NULL,
-                            actions TEXT NULL,
-                            notified_at TIMESTAMP NULL,
-                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_clinrec_att_ts ON public.clinical_recommendations (cod_atendimento, snapshot_ts DESC);")
-                conn.commit()
-            return True
-        except Exception as e:
-            last_err = e
-            print(f"[WARN] DB ainda não pronto: {e}", flush=True)
-            time.sleep(wait)
-            wait = min(wait * 1.7, 6.0)
+def has_column(cols: List[str], col: str) -> bool:
+    return col in cols
 
-    print(f"[WARN] DB não ficou pronto no startup. Último erro: {last_err}", flush=True)
-    return False
-
-
-@app.on_event("startup")
-def _startup():
-    ensure_schema_with_retry()
-
-
-def get_table_columns(table: str) -> List[Dict[str, Any]]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT column_name, is_nullable, data_type, column_default
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name=%s
-                ORDER BY ordinal_position;
-            """, (table,))
-            return cur.fetchall() or []
-
-
-def build_insert(table: str, row_values: Dict[str, Any]) -> Tuple[str, List[Any]]:
-    cols_meta = get_table_columns(table)
-    existing = {c["column_name"] for c in cols_meta}
-    cols = []
-    vals = []
-    for k, v in row_values.items():
-        if k in existing:
-            cols.append(k)
-            vals.append(v)
-    if not cols:
-        raise RuntimeError(f"Nenhuma coluna compatível encontrada para inserir em {table}")
-    placeholders = ", ".join(["%s"] * len(cols))
-    col_list = ", ".join(cols)
-    sql = f"INSERT INTO public.{table} ({col_list}) VALUES ({placeholders});"
-    return sql, vals
-
-
-class VitalRow(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    cod_atendimento: int
-    id_ricadpac: Optional[int] = None
-    event_ts: datetime
-    data_lanc: date
-    hora: Optional[int] = None
-    minuto: Optional[int] = None
-    temp: Optional[float] = None
-    pas: Optional[int] = None
-    pad: Optional[int] = None
-    fc: Optional[int] = None
-    fr: Optional[int] = None
-    spo2: Optional[int] = None
-    dor: Optional[str] = None
-    uso_o2: Optional[str] = None
-    nivel_consciencia: Optional[str] = None
-    profissional: Optional[str] = None
-
-
-def _try_json_load(v: Any) -> Any:
+def safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
     if isinstance(v, str):
         s = v.strip()
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-            try:
-                return json.loads(s)
-            except Exception:
-                return v
-    return v
-
-
-def _to_int(v):
-    if v is None or v == "":
-        return None
-    try:
-        return int(float(v))
-    except Exception:
-        return None
-
-
-def _to_float(v):
-    if v is None or v == "":
-        return None
-    try:
-        return float(v)
-    except Exception:
-        return None
-
-
-def _parse_dt_iso(v) -> Optional[datetime]:
-    if not v:
-        return None
-    try:
-        s = str(v).replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def _clean_key(k: str) -> str:
-    s = str(k).strip()
-    if s.startswith("[") and s.endswith("]"):
-        s = s[1:-1].strip()
-    return s
-
-
-def _alias_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(row)
-    for k, v in list(row.items()):
-        if not isinstance(k, str):
-            continue
-        ck = _clean_key(k)
-        if ck != k:
-            out.setdefault(ck, v)
-        out.setdefault(ck.upper(), v)
-    return out
-
-
-def _pick(d: Dict[str, Any], *keys: str):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
-
-
-def _parse_event_ts(r: Dict[str, Any]) -> datetime:
-    ev = _pick(r, "event_ts", "EVENT_TS")
-    dt = _parse_dt_iso(ev)
-    if dt:
-        return dt.replace(second=0, microsecond=0)
-
-    dh = _pick(r, "DATA_HORA_LANC_MINUTO", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_HORA_LANC_MINUTO]")
-    dl = _pick(r, "DATA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]")
-    h  = _pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]")
-    m  = _pick(r, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]")
-
-    dt_dh = _parse_dt_iso(dh)
-    if dt_dh:
-        if dt_dh.hour == 0 and dt_dh.minute == 0 and dl is not None:
-            base = _parse_dt_iso(dl)
-            if base:
-                return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
-        return dt_dh.replace(second=0, microsecond=0)
-
-    base = _parse_dt_iso(dl)
-    if not base:
-        raise ValueError("Sem DATA_LANC/DATE para construir event_ts")
-    return base.replace(hour=int(h or 0), minute=int(m or 0), second=0, microsecond=0)
-
-
-def _parse_data_lanc(r: Dict[str, Any], event_ts: datetime) -> date:
-    dl = _pick(r, "DATA_LANC", "data_lanc", "VW_PREVITA_VITAIS_AGRUPADOS[DATA_LANC]", "[DATA_LANC]")
-    dt = _parse_dt_iso(dl)
-    if dt:
-        return dt.date()
-    return event_ts.date()
-
-
-def normalize_powerbi_rows(rows: List[Dict[str, Any]]) -> List[VitalRow]:
-    out: List[VitalRow] = []
-    for rr in rows:
-        r = _alias_row_keys(rr)
-        try:
-            cod = _pick(r, "COD_ATENDIMENTO", "cod_atendimento", "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]", "[COD_ATENDIMENTO]")
-            if cod is None:
-                continue
-
-            event_ts = _parse_event_ts(r)
-            data_lanc = _parse_data_lanc(r, event_ts)
-
-            payload = {
-                "cod_atendimento": int(float(cod)),
-                "id_ricadpac": _to_int(_pick(r, "ID_RICADPAC", "id_ricadpac", "VW_PREVITA_VITAIS_AGRUPADOS[ID_RICADPAC]", "[ID_RICADPAC]")),
-                "event_ts": event_ts,
-                "data_lanc": data_lanc,
-
-                "hora": _to_int(_pick(r, "HORA_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[HORA_LANC]", "[HORA_LANC]")),
-                "minuto": _to_int(_pick(r, "MINUTO_LANC", "VW_PREVITA_VITAIS_AGRUPADOS[MINUTO_LANC]", "[MINUTO_LANC]")),
-
-                "temp": _to_float(_pick(r, "TEMP", "VW_PREVITA_VITAIS_AGRUPADOS[TEMP]", "[TEMP]")),
-                "dor": _pick(r, "DOR", "VW_PREVITA_VITAIS_AGRUPADOS[DOR]", "[DOR]"),
-                "fr": _to_int(_pick(r, "FR", "VW_PREVITA_VITAIS_AGRUPADOS[FR]", "[FR]")),
-                "fc": _to_int(_pick(r, "FC", "VW_PREVITA_VITAIS_AGRUPADOS[FC]", "[FC]")),
-                "pad": _to_int(_pick(r, "PAD", "VW_PREVITA_VITAIS_AGRUPADOS[PAD]", "[PAD]")),
-                "pas": _to_int(_pick(r, "PAS", "VW_PREVITA_VITAIS_AGRUPADOS[PAS]", "[PAS]")),
-                "spo2": _to_int(_pick(r, "SPO2", "VW_PREVITA_VITAIS_AGRUPADOS[SPO2]", "[SPO2]")),
-                "uso_o2": _pick(r, "USO_O2", "VW_PREVITA_VITAIS_AGRUPADOS[USO_O2]", "[USO_O2]"),
-                "nivel_consciencia": _pick(r, "NIVEL_CONSCIENCIA", "VW_PREVITA_VITAIS_AGRUPADOS[NIVEL_CONSCIENCIA]", "[NIVEL_CONSCIENCIA]"),
-                "profissional": _pick(r, "PROFISSIONAL", "VW_PREVITA_VITAIS_AGRUPADOS[PROFISSIONAL]", "[PROFISSIONAL]"),
-            }
-            out.append(VitalRow(**payload))
-        except Exception as e:
-            print(f"[WARN] Linha inválida ignorada: {e}", flush=True)
-    return out
-
-
-def _extract_tables_struct(pb: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, Any]], List[Any]]]:
-    try:
-        tables = pb["results"][0]["tables"]
-        if not tables:
+        if not s:
             return None
-        t0 = tables[0]
-        cols = t0.get("columns") or []
-        rows = t0.get("rows") or []
-        if isinstance(rows, list):
-            return cols, rows
-    except Exception:
-        return None
+        # troca vírgula decimal
+        s = s.replace(".", "").replace(",", ".") if re.search(r"\d+,\d+", s) else s.replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
     return None
 
-
-def _rows_list_to_dicts(columns: List[Dict[str, Any]], rows: List[Any]) -> List[Dict[str, Any]]:
-    if not rows:
-        return []
-    if isinstance(rows[0], dict):
-        return rows  # type: ignore
-    if not columns or not isinstance(rows[0], list):
-        return []
-    names = [str(c.get("name") or "") for c in columns]
-    out: List[Dict[str, Any]] = []
-    for arr in rows:
-        if not isinstance(arr, list):
-            continue
-        d = {}
-        for i, nm in enumerate(names):
-            if i < len(arr):
-                d[nm] = arr[i]
-        out.append(d)
-    return out
-
-
-def extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    payload = _try_json_load(payload)
-    if not isinstance(payload, dict):
-        return []
-    pb = _try_json_load(payload.get("powerbi"))
-    if isinstance(pb, dict):
-        ts = _extract_tables_struct(pb)
-        if ts:
-            cols, rows = ts
-            mapped = _rows_list_to_dicts(cols, rows)
-            if mapped:
-                return mapped
+def safe_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        s = s.replace(".", "").replace(",", ".")
         try:
-            rows = pb["results"][0]["tables"][0]["rows"]
-            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-                return rows
+            return int(float(s))
         except Exception:
-            pass
-    if isinstance(payload.get("rows"), list):
-        rr = payload["rows"]
-        if rr and isinstance(rr[0], dict):
-            return rr
+            return None
+    return None
+
+def parse_date(v: Any) -> Optional[date]:
+    if v is None:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        # pode vir "2026-02-03T00:00:00" ou "2026-02-03"
+        try:
+            if "T" in s:
+                return datetime.fromisoformat(s.replace("Z", "")).date()
+            return datetime.fromisoformat(s).date()
+        except Exception:
+            return None
+    return None
+
+def parse_datetime(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", ""))
+        except Exception:
+            return None
+    return None
+
+# -----------------------------------------------------------------------------
+# Payload extraction / normalization
+# -----------------------------------------------------------------------------
+def normalize_key(k: str) -> str:
+    """
+    "[FC]" -> "FC"
+    " NIVEL_CONSCIENCIA " -> "NIVEL_CONSCIENCIA"
+    """
+    if k is None:
+        return ""
+    k = str(k).strip()
+    k = k.strip("[]")
+    k = k.replace(" ", "_")
+    k = k.upper()
+    return k
+
+def extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Espera receber algo como:
+    { "powerbi": { "results": [ { "tables": [ { "rows": [ {...}, ... ] } ] } ] } }
+
+    Também tolera:
+    { "results": ... } ou { "tables": ... } se vier direto.
+    """
+    obj = payload
+    if isinstance(payload, dict) and "powerbi" in payload and isinstance(payload["powerbi"], dict):
+        obj = payload["powerbi"]
+
+    # Tentativas em cascata
+    if isinstance(obj, dict) and "results" in obj:
+        results = obj.get("results") or []
+        if results and isinstance(results, list):
+            r0 = results[0] or {}
+            tables = r0.get("tables") or []
+            if tables and isinstance(tables, list):
+                t0 = tables[0] or {}
+                rows = t0.get("rows") or []
+                if isinstance(rows, list):
+                    return [x for x in rows if isinstance(x, dict)]
+    if isinstance(obj, dict) and "tables" in obj:
+        tables = obj.get("tables") or []
+        if tables and isinstance(tables, list):
+            t0 = tables[0] or {}
+            rows = t0.get("rows") or []
+            if isinstance(rows, list):
+                return [x for x in rows if isinstance(x, dict)]
+    if isinstance(obj, dict) and "rows" in obj and isinstance(obj["rows"], list):
+        return [x for x in obj["rows"] if isinstance(x, dict)]
+
     return []
 
-
-def compute_recommendations(rows: List[VitalRow]) -> List[Dict[str, Any]]:
-    recs: List[Dict[str, Any]] = []
-    for r in rows:
-        level = None
-        syndrome = None
-        confidence = None
-        actions = None
-
-        if r.pas is not None and r.pas < 90:
-            level = "IMEDIATO"
-            syndrome = "Hipotensão"
-            confidence = 0.85
-            actions = "Checar PA manual, perfusão, sangramento/dor e acionar médico conforme protocolo."
-        elif r.spo2 is not None and r.spo2 < 92:
-            level = "PRIORIDADE"
-            syndrome = "Hipoxemia"
-            confidence = 0.70
-            actions = "Reavaliar oximetria, verificar O2, checar desconforto respiratório e acionar protocolo."
-        elif r.fc is not None and (r.fc >= 130 or r.fc <= 40):
-            level = "PRIORIDADE"
-            syndrome = "FC crítica"
-            confidence = 0.65
-            actions = "Repetir sinais vitais, checar sintomas, ECG se disponível e acionar médico."
-
-        if level:
-            recs.append({
-                "cod_atendimento": r.cod_atendimento,
-                "snapshot_ts": r.event_ts,
-                "recommendation_level": level,
-                "syndrome": syndrome,
-                "confidence": confidence,
-                "actions": actions
-            })
-    return recs
-
-
-def upsert_vitals_events(cur, cols_events: set, r: VitalRow):
-    # obrigatórios para o nosso event_key
-    if "event_key" not in cols_events:
-        print("[WARN] vitals_events não tem event_key; pulando UPSERT.", flush=True)
-        return False
-
-    event_key = f"{r.cod_atendimento}|{r.event_ts.isoformat()}"
-
-    # valores possíveis
-    candidate = {
-        "event_key": event_key,
-        "cod_atendimento": r.cod_atendimento,
-        "id_ricadpac": r.id_ricadpac,
-        "event_ts": r.event_ts,
-
-        # só entra se existir na tabela:
-        "data_lanc": r.data_lanc,
-        "temp": r.temp,
-        "pas": r.pas,
-        "pad": r.pad,
-        "fc": r.fc,
-        "fr": r.fr,
-        "spo2": r.spo2,
-        "dor": r.dor,
-        "uso_o2": r.uso_o2,
-        "nivel_consciencia": r.nivel_consciencia,
-        "profissional": r.profissional,
-    }
-
-    # filtra apenas colunas existentes
-    insert_cols = [k for k in candidate.keys() if k in cols_events]
-    insert_vals = [candidate[k] for k in insert_cols]
-
-    # updated_at (se existir) sempre atualiza
-    if "updated_at" in cols_events:
-        insert_cols.append("updated_at")
-        insert_vals.append(datetime.utcnow())
-
-    # monta INSERT
-    cols_sql = ", ".join(insert_cols)
-    ph_sql = ", ".join(["%s"] * len(insert_cols))
-
-    # monta UPDATE SET dinamicamente (não atualiza chaves)
-    updatable = [c for c in insert_cols if c not in ("event_key", "cod_atendimento")]
-    set_parts = []
-    for c in updatable:
-        if c == "updated_at":
-            set_parts.append("updated_at = CURRENT_TIMESTAMP")
-        else:
-            set_parts.append(f"{c} = COALESCE(EXCLUDED.{c}, vitals_events.{c})")
-
-    set_sql = ", ".join(set_parts) if set_parts else "updated_at = CURRENT_TIMESTAMP"
-
-    sql = f"""
-        INSERT INTO public.vitals_events ({cols_sql})
-        VALUES ({ph_sql})
-        ON CONFLICT (event_key) DO UPDATE SET
-            {set_sql};
+def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
+    Converte um row do Power BI em campos canônicos usados no banco.
+    """
+    norm: Dict[str, Any] = {}
+    for k, v in row.items():
+        nk = normalize_key(k)
+        norm[nk] = v
 
-    cur.execute(sql, insert_vals)
-    return True
+    # Mapas de possíveis nomes
+    cod_atendimento = safe_int(norm.get("COD_ATENDIMENTO")) or safe_int(norm.get("ID"))  # seu Power BI mostra "ID"
+    id_ricadpac = safe_int(norm.get("ID_RICADPAC")) or safe_int(norm.get("ID_RICADPAC_"))  # tolerância
+    data_lanc = parse_date(norm.get("DATA_LANC")) or parse_date(norm.get("DATA")) or parse_date(norm.get("DATA_LANCAMENTO"))
+    hora_lanc = safe_int(norm.get("HORA_LANC"))
+    minuto_lanc = safe_int(norm.get("MINUTO_LANC"))
 
+    # Alguns modelos têm DATA_HORA_LANC_MINUTO direto
+    dt_full = parse_datetime(norm.get("DATA_HORA_LANC_MINUTO")) or parse_datetime(norm.get("EVENT_TS"))
 
-def persist_all(raw_payload: Any, rows: List[VitalRow]) -> Dict[str, Any]:
-    raw_inserted = 0
-    events_upserted = 0
-    critical_recs = 0
+    if dt_full is None:
+        # monta event_ts a partir de data/hora/minuto
+        if data_lanc and hora_lanc is not None and minuto_lanc is not None:
+            dt_full = datetime.combine(data_lanc, time(hour=hora_lanc, minute=minuto_lanc, second=0))
 
-    now = datetime.utcnow()
-    raw_obj = raw_payload if isinstance(raw_payload, dict) else {"payload": raw_payload}
-
-    cols_events = {c["column_name"] for c in get_table_columns("vitals_events")}
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 1) vitals_raw (schema-driven + data_lanc obrigatório)
-            for r in rows:
-                raw_row_values = {
-                    "event_ts": r.event_ts,
-                    "data_lanc": r.data_lanc,
-
-                    "cod_atendimento": r.cod_atendimento,
-                    "id_ricadpac": r.id_ricadpac,
-
-                    "hora_lanc": r.hora,
-                    "minuto_lanc": r.minuto,
-
-                    "hora": r.hora,
-                    "minuto": r.minuto,
-
-                    "temp": r.temp,
-                    "pas": r.pas,
-                    "pad": r.pad,
-                    "fc": r.fc,
-                    "fr": r.fr,
-                    "spo2": r.spo2,
-                    "dor": r.dor,
-                    "uso_o2": r.uso_o2,
-                    "nivel_consciencia": r.nivel_consciencia,
-                    "profissional": r.profissional,
-
-                    "source": "power_automate",
-                    "received_at": now,
-                    "created_at": now,
-                    "updated_at": now,
-                    "payload": json.dumps(raw_obj),
-                }
-
-                sql, vals = build_insert("vitals_raw", raw_row_values)
-                cur.execute(sql, vals)
-                raw_inserted += 1
-
-            # 2) vitals_events (UPSERT dinâmico SEM assumir data_lanc)
-            for r in rows:
-                if upsert_vitals_events(cur, cols_events, r):
-                    events_upserted += 1
-
-            # 3) recomendações + Telegram
-            recs = compute_recommendations(rows)
-            for rec in recs:
-                cur.execute("""
-                    INSERT INTO public.clinical_recommendations
-                        (cod_atendimento, snapshot_ts, recommendation_level, syndrome, confidence, actions, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,CURRENT_TIMESTAMP);
-                """, (
-                    rec["cod_atendimento"],
-                    rec["snapshot_ts"],
-                    rec["recommendation_level"],
-                    rec.get("syndrome"),
-                    rec.get("confidence"),
-                    rec.get("actions"),
-                ))
-                critical_recs += 1
-
-                msg = (
-                    f"🚨 <b>PREVITA – ALERTA {rec['recommendation_level']}</b>\n\n"
-                    f"🧾 <b>Atendimento:</b> {rec['cod_atendimento']}\n"
-                    f"🕒 <b>Snapshot:</b> {rec['snapshot_ts']}\n"
-                    f"🧠 <b>Síndrome:</b> {rec.get('syndrome') or '-'}\n"
-                    f"📊 <b>Confiança:</b> {rec.get('confidence') or '-'}\n\n"
-                    f"✅ <b>Ações:</b>\n{(rec.get('actions') or '').strip()[:3500]}"
-                )
-                send_telegram_message_sync(msg)
-
-        conn.commit()
-
-    return {
-        "raw_inserted": raw_inserted,
-        "events_upserted": events_upserted,
-        "critical_recommendations": critical_recs
+    # vitais
+    out = {
+        "cod_atendimento": cod_atendimento,
+        "id_ricadpac": id_ricadpac,
+        "data_lanc": data_lanc,
+        "hora_lanc": hora_lanc,
+        "minuto_lanc": minuto_lanc,
+        "event_ts": dt_full,
+        "temp": safe_float(norm.get("TEMP")),
+        "dor": safe_float(norm.get("DOR")),
+        "fr": safe_float(norm.get("FR")),
+        "fc": safe_float(norm.get("FC")),
+        "pad": safe_float(norm.get("PAD")),
+        "pas": safe_float(norm.get("PAS")),
+        "spo2": safe_float(norm.get("SPO2")),
+        "uso_o2": (str(norm.get("USO_O2")).strip() if norm.get("USO_O2") is not None else None),
+        "nivel_consciencia": (str(norm.get("NIVEL_CONSCIENCIA")).strip() if norm.get("NIVEL_CONSCIENCIA") is not None else None),
+        "profissional": (str(norm.get("PROFISSIONAL")).strip() if norm.get("PROFISSIONAL") is not None else None),
+        # raw
+        "source": SOURCE_NAME,
+        "raw_payload": row,  # salva o row original
     }
 
+    # event_key para deduplicar (mesmo atendimento + mesmo minuto)
+    if out["cod_atendimento"] is not None and out["event_ts"] is not None:
+        out["event_key"] = f'{out["cod_atendimento"]}::{out["event_ts"].isoformat()}'
+    else:
+        out["event_key"] = None
+
+    return out
+
+# -----------------------------------------------------------------------------
+# UPSERT builder (schema-aware)
+# -----------------------------------------------------------------------------
+def upsert_rows(conn, table: str, rows: List[Dict[str, Any]], schema: str = "public") -> Tuple[int, int, int, List[str]]:
+    """
+    Insere/atualiza rows em uma tabela, usando somente colunas existentes.
+    Tenta ON CONFLICT (event_key) se a coluna existir; senão faz INSERT simples.
+    Retorna: inserted_like, updated_like, skipped, warnings[]
+    """
+    cols = get_table_columns(conn, table, schema=schema)
+    if not cols:
+        raise RuntimeError(f"Tabela {schema}.{table} não encontrada ou sem colunas.")
+
+    warnings: List[str] = []
+    inserted_like = 0
+    updated_like = 0
+    skipped = 0
+
+    # Colunas mínimas para vitals_raw (NOT NULL no seu banco)
+    required = []
+    if table == "vitals_raw":
+        required = ["event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "event_key"]
+    elif table == "vitals_events":
+        required = ["event_ts", "cod_atendimento", "id_ricadpac", "event_key"]
+
+    use_conflict = has_column(cols, "event_key")
+
+    for r in rows:
+        # valida required
+        missing = [k for k in required if r.get(k) is None]
+        if missing:
+            skipped += 1
+            continue
+
+        # Monta dict só com colunas existentes
+        payload = {}
+        for k, v in r.items():
+            if k in cols:
+                payload[k] = v
+
+        # Campos padrão se existirem
+        now = datetime.utcnow()
+        if "updated_at" in cols:
+            payload["updated_at"] = now
+        if "created_at" in cols and "created_at" not in payload:
+            payload["created_at"] = now
+
+        # raw_payload: salva JSON se a coluna for json/jsonb
+        if "raw_payload" in cols and isinstance(payload.get("raw_payload"), (dict, list)):
+            payload["raw_payload"] = json.dumps(payload["raw_payload"], ensure_ascii=False)
+
+        if not payload:
+            skipped += 1
+            continue
+
+        columns = list(payload.keys())
+        values = [payload[c] for c in columns]
+
+        # INSERT
+        insert_stmt = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
+            sql.Identifier(schema),
+            sql.Identifier(table),
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+
+        if use_conflict:
+            # UPDATE somente do que veio (exceto created_at)
+            set_cols = [c for c in columns if c not in ("created_at",)]
+            if set_cols:
+                update_stmt = sql.SQL(", ").join(
+                    sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+                    for c in set_cols
+                )
+                insert_stmt = insert_stmt + sql.SQL(" ON CONFLICT (event_key) DO UPDATE SET {}").format(update_stmt)
+            else:
+                insert_stmt = insert_stmt + sql.SQL(" ON CONFLICT (event_key) DO NOTHING")
+
+        try:
+            conn.execute(insert_stmt, values)
+            # Não dá para saber com perfeição insert vs update sem RETURNING e xmax; simplificamos:
+            inserted_like += 1
+        except Exception as e:
+            msg = str(e)
+            # Se falhar por ON CONFLICT alvo inexistente, tenta INSERT simples
+            if "there is no unique or exclusion constraint matching the ON CONFLICT specification" in msg:
+                warnings.append(f"{table}: não há constraint única em event_key; inserindo sem upsert.")
+                try:
+                    conn.execute(
+                        sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
+                            sql.Identifier(schema),
+                            sql.Identifier(table),
+                            sql.SQL(", ").join(map(sql.Identifier, columns)),
+                            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+                        ),
+                        values,
+                    )
+                    inserted_like += 1
+                except Exception as e2:
+                    warnings.append(f"{table}: falha ao inserir uma linha: {e2}")
+                    skipped += 1
+            else:
+                warnings.append(f"{table}: falha ao inserir uma linha: {e}")
+                skipped += 1
+
+    return inserted_like, updated_like, skipped, warnings
+
+# -----------------------------------------------------------------------------
+# Risk / Recommendations (gancho)
+# -----------------------------------------------------------------------------
+def compute_risk(row: Dict[str, Any]) -> Tuple[int, str, str]:
+    """
+    Regra simples (placeholder) só para não quebrar o fluxo.
+    Você depois substitui pela IA.
+    """
+    score = 0
+    reasons = []
+
+    spo2 = row.get("spo2")
+    pas = row.get("pas")
+    fc = row.get("fc")
+    fr = row.get("fr")
+    temp = row.get("temp")
+
+    if spo2 is not None and spo2 < 92:
+        score += 3
+        reasons.append(f"SpO2 baixa ({spo2})")
+    if pas is not None and pas < 90:
+        score += 3
+        reasons.append(f"PAS baixa ({pas})")
+    if fc is not None and fc > 120:
+        score += 2
+        reasons.append(f"FC alta ({fc})")
+    if fr is not None and fr > 24:
+        score += 2
+        reasons.append(f"FR alta ({fr})")
+    if temp is not None and temp >= 38:
+        score += 1
+        reasons.append(f"Febre ({temp})")
+
+    if score >= 5:
+        level = "CRITICO"
+    elif score >= 3:
+        level = "ATENCAO"
+    else:
+        level = "OK"
+
+    text = "; ".join(reasons) if reasons else "Sem critérios de risco pela regra simples."
+    return score, level, text
+
+def upsert_recommendations_if_exists(conn, rows: List[Dict[str, Any]]):
+    """
+    Se existir uma tabela de recomendações, grava/atualiza.
+    (Schema-aware: só escreve colunas existentes.)
+    """
+    # tente nomes comuns (ajuste se o seu nome for diferente)
+    candidates = ["clinical_recommendations", "clinical_recommendat", "recommendations"]
+    existing = None
+    for t in candidates:
+        try:
+            cols = get_table_columns(conn, t)
+            if cols:
+                existing = t
+                break
+        except Exception:
+            continue
+
+    if not existing:
+        return
+
+    cols = get_table_columns(conn, existing)
+    use_conflict = "event_key" in cols
+
+    for r in rows:
+        score, level, text = compute_risk(r)
+        payload = {
+            "event_key": r.get("event_key"),
+            "cod_atendimento": r.get("cod_atendimento"),
+            "id_ricadpac": r.get("id_ricadpac"),
+            "event_ts": r.get("event_ts"),
+            "risk_score": score,
+            "risk_level": level,
+            "recommendation": text,
+            "source": SOURCE_NAME,
+            "updated_at": datetime.utcnow(),
+        }
+
+        payload = {k: v for k, v in payload.items() if k in cols and v is not None}
+        if "created_at" in cols and "created_at" not in payload:
+            payload["created_at"] = datetime.utcnow()
+
+        if not payload:
+            continue
+        if "event_key" not in payload:
+            continue
+
+        columns = list(payload.keys())
+        values = [payload[c] for c in columns]
+
+        stmt = sql.SQL("INSERT INTO public.{} ({}) VALUES ({})").format(
+            sql.Identifier(existing),
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+        if use_conflict:
+            set_cols = [c for c in columns if c not in ("created_at",)]
+            if set_cols:
+                stmt = stmt + sql.SQL(" ON CONFLICT (event_key) DO UPDATE SET {}").format(
+                    sql.SQL(", ").join(
+                        sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+                        for c in set_cols
+                    )
+                )
+
+        try:
+            conn.execute(stmt, values)
+        except Exception:
+            # não travar o batch por causa de recomendações
+            continue
+
+# -----------------------------------------------------------------------------
+# FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="PREVITA API", version=APP_VERSION, openapi_url="/openapi.json")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0.8"}
-
+    return {"ok": True, "version": APP_VERSION}
 
 @app.get("/v1/db/ping")
-def db_ping(x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
-    _check_key(x_api_key)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 AS ok;")
-            r = cur.fetchone()
-    return {"ok": True, "db": r["ok"], "version": "4.0.8"}
-
+def db_ping():
+    try:
+        with db_connect() as conn:
+            v = conn.execute("SELECT 1").fetchone()[0]
+        return {"ok": True, "db": v}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 @app.post("/v1/vitals/batch")
-def vitals_batch(payload: Any = Body(...), x_api_key: Optional[str] = Header(None, alias="X-API-KEY")):
-    _check_key(x_api_key)
+async def vitals_batch(request: Request):
+    """
+    Recebe payload do Power Automate e grava em:
+    - vitals_raw (todos os campos vitais)
+    - vitals_events (somente colunas existentes)
+    + (gancho) recommendations se existir tabela compatível
+    """
     try:
-        rows_raw = extract_rows_from_payload(payload)
-        received = len(rows_raw)
-        vitals = normalize_powerbi_rows(rows_raw)
-        normalized = len(vitals)
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body precisa ser JSON.")
 
-        print(f"[INGEST] received_rows={received} normalized={normalized}", flush=True)
+    rows_raw = extract_rows(payload)
+    received = len(rows_raw)
 
-        if normalized <= 0:
-            row0 = rows_raw[0] if rows_raw else None
-            return {
-                "ok": True,
-                "queued": False,
-                "received": received,
-                "normalized": 0,
-                "message": "Nenhuma linha passou na normalização. COD_ATENDIMENTO não foi encontrado no formato retornado.",
-                "debug": {
-                    "top_keys": list(payload.keys())[:50] if isinstance(payload, dict) else None,
-                    "row0_type": type(row0).__name__ if row0 is not None else None,
-                    "row0_keys_sample": list(row0.keys())[:80] if isinstance(row0, dict) else None,
-                    "version": "4.0.8",
-                }
-            }
+    # debug_keys_sample (para te ajudar)
+    debug_keys_sample = []
+    if isinstance(payload, dict):
+        debug_keys_sample = list(payload.keys())[:8]
 
-        stats = persist_all(raw_payload=payload, rows=vitals)
+    normalized_rows: List[Dict[str, Any]] = []
+    for rr in rows_raw:
+        nr = normalize_row(rr)
 
+        # filtro mínimo: precisa reconhecer atendimento + horário
+        if nr.get("cod_atendimento") is None:
+            continue
+        if nr.get("event_ts") is None:
+            continue
+        if nr.get("data_lanc") is None:
+            # tenta derivar do event_ts se existir
+            if nr.get("event_ts"):
+                nr["data_lanc"] = nr["event_ts"].date()
+        if nr.get("data_lanc") is None:
+            continue
+        if nr.get("event_key") is None:
+            nr["event_key"] = f'{nr["cod_atendimento"]}::{nr["event_ts"].isoformat()}'
+
+        normalized_rows.append(nr)
+
+    normalized = len(normalized_rows)
+    if normalized == 0:
         return {
             "ok": True,
             "queued": False,
             "received": received,
-            "normalized": normalized,
-            "stats": stats,
-            "message": "Gravou vitals_raw (com data_lanc) e fez UPSERT em vitals_events conforme schema real. Recommendations + Telegram para críticos.",
-            "version": "4.0.8"
+            "normalized": 0,
+            "inserted_raw": 0,
+            "inserted_events": 0,
+            "skipped": received,
+            "message": "Nenhuma linha passou na normalização. Payload não contém campos mínimos (ID/COD_ATENDIMENTO + DATA_LANC/HORA_LANC/MINUTO_LANC ou DATA_HORA_LANC_MINUTO).",
+            "debug_keys_sample": debug_keys_sample,
+            "version": APP_VERSION,
         }
 
+    warnings_all: List[str] = []
+
+    try:
+        with db_connect() as conn:
+            with conn.transaction():
+                # vitals_raw: grava tudo que existir na tabela
+                ins_raw, _, skip_raw, warn_raw = upsert_rows(conn, "vitals_raw", normalized_rows)
+                warnings_all.extend(warn_raw)
+
+                # vitals_events: grava só o que existir (sem "data_lanc" se não existir)
+                ins_evt, _, skip_evt, warn_evt = upsert_rows(conn, "vitals_events", normalized_rows)
+                warnings_all.extend(warn_evt)
+
+                # gancho: recomendações (se existir tabela compatível)
+                upsert_recommendations_if_exists(conn, normalized_rows)
+
     except Exception as e:
-        err = str(e)
-        tb = traceback.format_exc()
-        print("[ERROR] /v1/vitals/batch crashed:", err, flush=True)
-        print(tb, flush=True)
-        return {"ok": False, "error": err, "where": "/v1/vitals/batch", "version": "4.0.8"}
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "where": "/v1/vitals/batch", "version": APP_VERSION},
+        )
+
+    # Se quiser: aqui você acopla o envio Telegram somente para CRITICO (não incluí token/chat por segurança)
+    # - Sugestão: enviar só quando houve mudança real (event_key novo/alterado)
+
+    msg = "Dados processados e gravados (raw + events)."
+    if warnings_all:
+        msg += " Com avisos: " + " | ".join(warnings_all[:3])  # limita
+
+    return {
+        "ok": True,
+        "queued": False,
+        "received": received,
+        "normalized": normalized,
+        "inserted_raw": ins_raw,
+        "inserted_events": ins_evt,
+        "skipped": max(0, received - normalized),
+        "message": msg,
+        "debug_keys_sample": debug_keys_sample,
+        "version": APP_VERSION,
+    }
