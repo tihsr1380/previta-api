@@ -1,577 +1,706 @@
+# main.py
 import os
-import json
 import re
-import logging
+import json
 from datetime import datetime, date, time
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 import psycopg
-from psycopg import sql
-from fastapi import FastAPI, Request, HTTPException
+from psycopg.rows import dict_row
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("previta-api")
 
-APP_VERSION = os.getenv("APP_VERSION", "4.1.0")
+APP_VERSION = "4.1.0"
 
-# -----------------------------------------------------------------------------
-# DB helpers
-# -----------------------------------------------------------------------------
-def _sanitize_database_url(url: str) -> str:
-    """
-    Remove parâmetros problemáticos (ex: options/statement_timeout) que alguns poolers podem rejeitar.
-    Mantém sslmode/channel_binding se estiverem presentes.
-    """
-    if not url:
-        return url
-    # Remove parâmetros que podem quebrar poolers/pgbouncer
-    # Ex.: ...?sslmode=require&options=-c%20statement_timeout=...
-    url = re.sub(r"([?&])options=[^&]+", r"\1", url, flags=re.IGNORECASE)
-    url = re.sub(r"([?&])statement_timeout=[^&]+", r"\1", url, flags=re.IGNORECASE)
-    # limpa ?& ou && finais
-    url = url.replace("?&", "?").replace("&&", "&").rstrip("&").rstrip("?")
-    return url
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-DATABASE_URL = _sanitize_database_url(os.getenv("DATABASE_URL", "").strip())
-SOURCE_NAME = os.getenv("SOURCE_NAME", "power_automate")
+app = FastAPI(title="PREVITA API", version=APP_VERSION)
 
-if not DATABASE_URL:
-    log.warning("DATABASE_URL não definido. Configure no Render (Environment Variables).")
 
-def db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurado.")
-    # psycopg3
-    return psycopg.connect(DATABASE_URL)
+# -----------------------------
+# Helpers: parsing & normalize
+# -----------------------------
+def _now_ts() -> datetime:
+    return datetime.utcnow()
 
-def get_table_columns(conn, table: str, schema: str = "public") -> List[str]:
-    q = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = %s AND table_name = %s
-    ORDER BY ordinal_position
-    """
-    rows = conn.execute(q, (schema, table)).fetchall()
-    return [r[0] for r in rows]
 
-def has_column(cols: List[str], col: str) -> bool:
-    return col in cols
+def _strip_brackets_key(k: str) -> str:
+    # "[PAD]" -> "pad", " COD_ATENDIMENTO " -> "cod_atendimento"
+    k = k.strip()
+    if k.startswith("[") and k.endswith("]"):
+        k = k[1:-1]
+    k = k.strip().lower()
+    k = re.sub(r"\s+", "_", k)
+    k = k.replace("-", "_")
+    return k
 
-def safe_float(v: Any) -> Optional[float]:
+
+def _to_int(v: Any) -> Optional[int]:
     if v is None:
         return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        # troca vírgula decimal
-        s = s.replace(".", "").replace(",", ".") if re.search(r"\d+,\d+", s) else s.replace(",", ".")
-        try:
-            return float(s)
-        except Exception:
-            return None
-    return None
-
-def safe_int(v: Any) -> Optional[int]:
-    if v is None:
-        return None
+    if isinstance(v, bool):
+        return int(v)
     if isinstance(v, int):
         return v
     if isinstance(v, float):
         return int(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        s = s.replace(".", "").replace(",", ".")
-        try:
-            return int(float(s))
-        except Exception:
-            return None
-    return None
+    s = str(v).strip()
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return None
+    # remove thousand separators like "21.101,00" -> "21101"
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        f = float(s)
+        return int(f)
+    except Exception:
+        # last try: keep only digits
+        digits = re.sub(r"\D+", "", s)
+        return int(digits) if digits else None
 
-def parse_date(v: Any) -> Optional[date]:
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip()
+    if s == "" or s.lower() in ("nan", "none", "null"):
+        return None
+    # pt-BR: "36,5" -> 36.5 ; also handle "87,00"
+    s = s.replace(".", "").replace(",", ".") if re.search(r"\d+,\d+", s) else s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _parse_date(v: Any) -> Optional[date]:
     if v is None:
         return None
     if isinstance(v, date) and not isinstance(v, datetime):
         return v
     if isinstance(v, datetime):
         return v.date()
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        # pode vir "2026-02-03T00:00:00" ou "2026-02-03"
+    s = str(v).strip()
+    if not s:
+        return None
+    # Common: "2026-02-03T00:00:00" or "2026-02-03"
+    s = s.replace("T", " ")
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        pass
+    # dd/mm/yyyy
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})", s)
+    if m:
+        dd, mm, yyyy = m.groups()
         try:
-            if "T" in s:
-                return datetime.fromisoformat(s.replace("Z", "")).date()
-            return datetime.fromisoformat(s).date()
+            return date(int(yyyy), int(mm), int(dd))
         except Exception:
             return None
     return None
 
-def parse_datetime(v: Any) -> Optional[datetime]:
+
+def _parse_datetime(v: Any) -> Optional[datetime]:
     if v is None:
         return None
     if isinstance(v, datetime):
         return v
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace("T", " ")
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Accepts many shapes:
+    - {"powerbi": {...}}
+    - {"results":[{"tables":[{"rows":[...] }]}]}
+    - {"tables":[{"rows":[...]}]}
+    - {"rows":[...]}
+    - [...]
+    """
+    if payload is None:
+        return []
+
+    # If payload is bytes or string JSON
+    if isinstance(payload, (bytes, str)):
         try:
-            return datetime.fromisoformat(s.replace("Z", ""))
+            payload = json.loads(payload)
         except Exception:
-            return None
-    return None
+            return []
 
-# -----------------------------------------------------------------------------
-# Payload extraction / normalization
-# -----------------------------------------------------------------------------
-def normalize_key(k: str) -> str:
-    """
-    "[FC]" -> "FC"
-    " NIVEL_CONSCIENCIA " -> "NIVEL_CONSCIENCIA"
-    """
-    if k is None:
-        return ""
-    k = str(k).strip()
-    k = k.strip("[]")
-    k = k.replace(" ", "_")
-    k = k.upper()
-    return k
+    # Power Automate often wraps user json in {"powerbi": <PBI OUTPUT>}
+    if isinstance(payload, dict) and "powerbi" in payload:
+        return _extract_rows(payload["powerbi"])
 
-def extract_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Espera receber algo como:
-    { "powerbi": { "results": [ { "tables": [ { "rows": [ {...}, ... ] } ] } ] } }
+    # Direct rows
+    if isinstance(payload, dict) and "rows" in payload and isinstance(payload["rows"], list):
+        rows = payload["rows"]
+        return [r for r in rows if isinstance(r, dict)]
 
-    Também tolera:
-    { "results": ... } ou { "tables": ... } se vier direto.
-    """
-    obj = payload
-    if isinstance(payload, dict) and "powerbi" in payload and isinstance(payload["powerbi"], dict):
-        obj = payload["powerbi"]
+    # tables -> rows
+    if isinstance(payload, dict) and "tables" in payload and isinstance(payload["tables"], list):
+        all_rows: List[Dict[str, Any]] = []
+        for t in payload["tables"]:
+            if isinstance(t, dict) and isinstance(t.get("rows"), list):
+                all_rows.extend([r for r in t["rows"] if isinstance(r, dict)])
+        return all_rows
 
-    # Tentativas em cascata
-    if isinstance(obj, dict) and "results" in obj:
-        results = obj.get("results") or []
-        if results and isinstance(results, list):
-            r0 = results[0] or {}
-            tables = r0.get("tables") or []
-            if tables and isinstance(tables, list):
-                t0 = tables[0] or {}
-                rows = t0.get("rows") or []
-                if isinstance(rows, list):
-                    return [x for x in rows if isinstance(x, dict)]
-    if isinstance(obj, dict) and "tables" in obj:
-        tables = obj.get("tables") or []
-        if tables and isinstance(tables, list):
-            t0 = tables[0] or {}
-            rows = t0.get("rows") or []
-            if isinstance(rows, list):
-                return [x for x in rows if isinstance(x, dict)]
-    if isinstance(obj, dict) and "rows" in obj and isinstance(obj["rows"], list):
-        return [x for x in obj["rows"] if isinstance(x, dict)]
+    # results -> tables -> rows (PowerBI connector output)
+    if isinstance(payload, dict) and "results" in payload and isinstance(payload["results"], list):
+        all_rows: List[Dict[str, Any]] = []
+        for res in payload["results"]:
+            if isinstance(res, dict) and isinstance(res.get("tables"), list):
+                for t in res["tables"]:
+                    if isinstance(t, dict) and isinstance(t.get("rows"), list):
+                        all_rows.extend([r for r in t["rows"] if isinstance(r, dict)])
+        return all_rows
+
+    # Sometimes payload is list of dict already
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
 
     return []
 
-def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Converte um row do Power BI em campos canônicos usados no banco.
-    """
-    norm: Dict[str, Any] = {}
+
+def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     for k, v in row.items():
-        nk = normalize_key(k)
-        norm[nk] = v
-
-    # Mapas de possíveis nomes
-    cod_atendimento = safe_int(norm.get("COD_ATENDIMENTO")) or safe_int(norm.get("ID"))  # seu Power BI mostra "ID"
-    id_ricadpac = safe_int(norm.get("ID_RICADPAC")) or safe_int(norm.get("ID_RICADPAC_"))  # tolerância
-    data_lanc = parse_date(norm.get("DATA_LANC")) or parse_date(norm.get("DATA")) or parse_date(norm.get("DATA_LANCAMENTO"))
-    hora_lanc = safe_int(norm.get("HORA_LANC"))
-    minuto_lanc = safe_int(norm.get("MINUTO_LANC"))
-
-    # Alguns modelos têm DATA_HORA_LANC_MINUTO direto
-    dt_full = parse_datetime(norm.get("DATA_HORA_LANC_MINUTO")) or parse_datetime(norm.get("EVENT_TS"))
-
-    if dt_full is None:
-        # monta event_ts a partir de data/hora/minuto
-        if data_lanc and hora_lanc is not None and minuto_lanc is not None:
-            dt_full = datetime.combine(data_lanc, time(hour=hora_lanc, minute=minuto_lanc, second=0))
-
-    # vitais
-    out = {
-        "cod_atendimento": cod_atendimento,
-        "id_ricadpac": id_ricadpac,
-        "data_lanc": data_lanc,
-        "hora_lanc": hora_lanc,
-        "minuto_lanc": minuto_lanc,
-        "event_ts": dt_full,
-        "temp": safe_float(norm.get("TEMP")),
-        "dor": safe_float(norm.get("DOR")),
-        "fr": safe_float(norm.get("FR")),
-        "fc": safe_float(norm.get("FC")),
-        "pad": safe_float(norm.get("PAD")),
-        "pas": safe_float(norm.get("PAS")),
-        "spo2": safe_float(norm.get("SPO2")),
-        "uso_o2": (str(norm.get("USO_O2")).strip() if norm.get("USO_O2") is not None else None),
-        "nivel_consciencia": (str(norm.get("NIVEL_CONSCIENCIA")).strip() if norm.get("NIVEL_CONSCIENCIA") is not None else None),
-        "profissional": (str(norm.get("PROFISSIONAL")).strip() if norm.get("PROFISSIONAL") is not None else None),
-        # raw
-        "source": SOURCE_NAME,
-        "raw_payload": row,  # salva o row original
-    }
-
-    # event_key para deduplicar (mesmo atendimento + mesmo minuto)
-    if out["cod_atendimento"] is not None and out["event_ts"] is not None:
-        out["event_key"] = f'{out["cod_atendimento"]}::{out["event_ts"].isoformat()}'
-    else:
-        out["event_key"] = None
-
+        out[_strip_brackets_key(str(k))] = v
     return out
 
-# -----------------------------------------------------------------------------
-# UPSERT builder (schema-aware)
-# -----------------------------------------------------------------------------
-def upsert_rows(conn, table: str, rows: List[Dict[str, Any]], schema: str = "public") -> Tuple[int, int, int, List[str]]:
-    """
-    Insere/atualiza rows em uma tabela, usando somente colunas existentes.
-    Tenta ON CONFLICT (event_key) se a coluna existir; senão faz INSERT simples.
-    Retorna: inserted_like, updated_like, skipped, warnings[]
-    """
-    cols = get_table_columns(conn, table, schema=schema)
-    if not cols:
-        raise RuntimeError(f"Tabela {schema}.{table} não encontrada ou sem colunas.")
 
-    warnings: List[str] = []
-    inserted_like = 0
-    updated_like = 0
-    skipped = 0
+def _pick_first(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
 
-    # Colunas mínimas para vitals_raw (NOT NULL no seu banco)
-    required = []
-    if table == "vitals_raw":
-        required = ["event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "event_key"]
-    elif table == "vitals_events":
-        required = ["event_ts", "cod_atendimento", "id_ricadpac", "event_key"]
 
-    use_conflict = has_column(cols, "event_key")
+def _build_event_ts(data_lanc: date, hora_lanc: int, minuto_lanc: int) -> datetime:
+    # event_ts in DB is TIMESTAMP (no tz). We'll store UTC-naive datetime.
+    return datetime.combine(data_lanc, time(hour=hora_lanc, minute=minuto_lanc, second=0))
 
-    for r in rows:
-        # valida required
-        missing = [k for k in required if r.get(k) is None]
-        if missing:
-            skipped += 1
-            continue
 
-        # Monta dict só com colunas existentes
-        payload = {}
-        for k, v in r.items():
-            if k in cols:
-                payload[k] = v
+# -----------------------------
+# DB helpers
+# -----------------------------
+def _db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada.")
+    # psycopg3: just connect using conninfo string
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-        # Campos padrão se existirem
-        now = datetime.utcnow()
-        if "updated_at" in cols:
-            payload["updated_at"] = now
-        if "created_at" in cols and "created_at" not in payload:
-            payload["created_at"] = now
 
-        # raw_payload: salva JSON se a coluna for json/jsonb
-        if "raw_payload" in cols and isinstance(payload.get("raw_payload"), (dict, list)):
-            payload["raw_payload"] = json.dumps(payload["raw_payload"], ensure_ascii=False)
+def _ensure_indexes(conn) -> None:
+    # Make vitals_raw UPSERT-safe
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS vitals_raw_cod_event_uq
+        ON vitals_raw (cod_atendimento, event_ts);
+        """)
+        # (risk_events already has unique, but safe to ensure)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS risk_events_cod_event_uq
+        ON risk_events (cod_atendimento, event_ts);
+        """)
+    conn.commit()
 
-        if not payload:
-            skipped += 1
-            continue
 
-        columns = list(payload.keys())
-        values = [payload[c] for c in columns]
-
-        # INSERT
-        insert_stmt = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
-            sql.Identifier(schema),
-            sql.Identifier(table),
-            sql.SQL(", ").join(map(sql.Identifier, columns)),
-            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+def _get_table_columns(conn, table: str, schema: str = "public") -> List[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (schema, table),
         )
+        rows = cur.fetchall()
+    return [r["column_name"] for r in rows]
 
-        if use_conflict:
-            # UPDATE somente do que veio (exceto created_at)
-            set_cols = [c for c in columns if c not in ("created_at",)]
-            if set_cols:
-                update_stmt = sql.SQL(", ").join(
-                    sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
-                    for c in set_cols
-                )
-                insert_stmt = insert_stmt + sql.SQL(" ON CONFLICT (event_key) DO UPDATE SET {}").format(update_stmt)
-            else:
-                insert_stmt = insert_stmt + sql.SQL(" ON CONFLICT (event_key) DO NOTHING")
 
-        try:
-            conn.execute(insert_stmt, values)
-            # Não dá para saber com perfeição insert vs update sem RETURNING e xmax; simplificamos:
-            inserted_like += 1
-        except Exception as e:
-            msg = str(e)
-            # Se falhar por ON CONFLICT alvo inexistente, tenta INSERT simples
-            if "there is no unique or exclusion constraint matching the ON CONFLICT specification" in msg:
-                warnings.append(f"{table}: não há constraint única em event_key; inserindo sem upsert.")
-                try:
-                    conn.execute(
-                        sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
-                            sql.Identifier(schema),
-                            sql.Identifier(table),
-                            sql.SQL(", ").join(map(sql.Identifier, columns)),
-                            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
-                        ),
-                        values,
-                    )
-                    inserted_like += 1
-                except Exception as e2:
-                    warnings.append(f"{table}: falha ao inserir uma linha: {e2}")
-                    skipped += 1
-            else:
-                warnings.append(f"{table}: falha ao inserir uma linha: {e}")
-                skipped += 1
+def _table_exists(conn, table: str, schema: str = "public") -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema=%s AND table_name=%s
+            """,
+            (schema, table),
+        )
+        return cur.fetchone() is not None
 
-    return inserted_like, updated_like, skipped, warnings
 
-# -----------------------------------------------------------------------------
-# Risk / Recommendations (gancho)
-# -----------------------------------------------------------------------------
-def compute_risk(row: Dict[str, Any]) -> Tuple[int, str, str]:
+# -----------------------------
+# Risk logic (baseline)
+# -----------------------------
+def _compute_risk(v: Dict[str, Any]) -> Tuple[str, int, str]:
     """
-    Regra simples (placeholder) só para não quebrar o fluxo.
-    Você depois substitui pela IA.
+    Baseline rules. (Você pode trocar pela IA depois.)
+    Returns: risk_level, risk_score, reason
     """
     score = 0
     reasons = []
 
-    spo2 = row.get("spo2")
-    pas = row.get("pas")
-    fc = row.get("fc")
-    fr = row.get("fr")
-    temp = row.get("temp")
+    spo2 = v.get("spo2")
+    fc = v.get("fc")
+    fr = v.get("fr")
+    pas = v.get("pas")
+    pad = v.get("pad")
+    temp = v.get("temp")
+    nivel = (v.get("nivel_consciencia") or "").strip().upper()
+    uso_o2 = (v.get("uso_o2") or "").strip().upper()
 
-    if spo2 is not None and spo2 < 92:
+    if spo2 is not None:
+        if spo2 < 90:
+            score += 6
+            reasons.append("SpO2 < 90")
+        elif spo2 < 92:
+            score += 4
+            reasons.append("SpO2 < 92")
+
+    if fc is not None:
+        if fc >= 130 or fc <= 40:
+            score += 4
+            reasons.append("FC crítica")
+        elif fc >= 110 or fc <= 50:
+            score += 2
+            reasons.append("FC alterada")
+
+    if fr is not None:
+        if fr >= 30 or fr <= 8:
+            score += 4
+            reasons.append("FR crítica")
+        elif fr >= 22 or fr <= 10:
+            score += 2
+            reasons.append("FR alterada")
+
+    if pas is not None:
+        if pas < 90:
+            score += 4
+            reasons.append("PAS < 90")
+        elif pas < 100:
+            score += 2
+            reasons.append("PAS < 100")
+
+    if pad is not None:
+        if pad < 60:
+            score += 2
+            reasons.append("PAD < 60")
+
+    if temp is not None:
+        if temp >= 39.0 or temp < 35.0:
+            score += 3
+            reasons.append("Temperatura crítica")
+        elif temp >= 38.0:
+            score += 2
+            reasons.append("Febre")
+
+    if "SONOL" in nivel or "CONF" in nivel or "REBAIX" in nivel:
         score += 3
-        reasons.append(f"SpO2 baixa ({spo2})")
-    if pas is not None and pas < 90:
-        score += 3
-        reasons.append(f"PAS baixa ({pas})")
-    if fc is not None and fc > 120:
-        score += 2
-        reasons.append(f"FC alta ({fc})")
-    if fr is not None and fr > 24:
-        score += 2
-        reasons.append(f"FR alta ({fr})")
-    if temp is not None and temp >= 38:
+        reasons.append("Consciência alterada")
+
+    if uso_o2 not in ("", "NA", "N/A", "AR AMBIENTE", "AA"):
         score += 1
-        reasons.append(f"Febre ({temp})")
+        reasons.append("Em O2 suplementar")
 
-    if score >= 5:
-        level = "CRITICO"
-    elif score >= 3:
-        level = "ATENCAO"
-    else:
-        level = "OK"
+    if score >= 8:
+        return "CRITICO", score, "; ".join(reasons) if reasons else "Score alto"
+    if score >= 4:
+        return "ATENCAO", score, "; ".join(reasons) if reasons else "Score moderado"
+    return "OK", score, "; ".join(reasons) if reasons else "Sem critérios"
 
-    text = "; ".join(reasons) if reasons else "Sem critérios de risco pela regra simples."
-    return score, level, text
 
-def upsert_recommendations_if_exists(conn, rows: List[Dict[str, Any]]):
-    """
-    Se existir uma tabela de recomendações, grava/atualiza.
-    (Schema-aware: só escreve colunas existentes.)
-    """
-    # tente nomes comuns (ajuste se o seu nome for diferente)
-    candidates = ["clinical_recommendations", "clinical_recommendat", "recommendations"]
-    existing = None
-    for t in candidates:
-        try:
-            cols = get_table_columns(conn, t)
-            if cols:
-                existing = t
-                break
-        except Exception:
-            continue
+def _send_telegram_message(text: str) -> Tuple[bool, str]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "Telegram não configurado (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)."
 
-    if not existing:
-        return
-
-    cols = get_table_columns(conn, existing)
-    use_conflict = "event_key" in cols
-
-    for r in rows:
-        score, level, text = compute_risk(r)
-        payload = {
-            "event_key": r.get("event_key"),
-            "cod_atendimento": r.get("cod_atendimento"),
-            "id_ricadpac": r.get("id_ricadpac"),
-            "event_ts": r.get("event_ts"),
-            "risk_score": score,
-            "risk_level": level,
-            "recommendation": text,
-            "source": SOURCE_NAME,
-            "updated_at": datetime.utcnow(),
-        }
-
-        payload = {k: v for k, v in payload.items() if k in cols and v is not None}
-        if "created_at" in cols and "created_at" not in payload:
-            payload["created_at"] = datetime.utcnow()
-
-        if not payload:
-            continue
-        if "event_key" not in payload:
-            continue
-
-        columns = list(payload.keys())
-        values = [payload[c] for c in columns]
-
-        stmt = sql.SQL("INSERT INTO public.{} ({}) VALUES ({})").format(
-            sql.Identifier(existing),
-            sql.SQL(", ").join(map(sql.Identifier, columns)),
-            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
         )
-        if use_conflict:
-            set_cols = [c for c in columns if c not in ("created_at",)]
-            if set_cols:
-                stmt = stmt + sql.SQL(" ON CONFLICT (event_key) DO UPDATE SET {}").format(
-                    sql.SQL(", ").join(
-                        sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
-                        for c in set_cols
-                    )
-                )
+        if resp.status_code >= 200 and resp.status_code < 300:
+            return True, "ok"
+        return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return False, str(e)
 
-        try:
-            conn.execute(stmt, values)
-        except Exception:
-            # não travar o batch por causa de recomendações
-            continue
 
-# -----------------------------------------------------------------------------
-# FastAPI
-# -----------------------------------------------------------------------------
-app = FastAPI(title="PREVITA API", version=APP_VERSION, openapi_url="/openapi.json")
-
+# -----------------------------
+# API endpoints
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "version": APP_VERSION}
 
+
 @app.get("/v1/db/ping")
 def db_ping():
     try:
-        with db_connect() as conn:
-            v = conn.execute("SELECT 1").fetchone()[0]
-        return {"ok": True, "db": v}
+        with _db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 as ok;")
+                row = cur.fetchone()
+        return {"ok": True, "db": row["ok"], "version": APP_VERSION}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e), "version": APP_VERSION})
+
 
 @app.post("/v1/vitals/batch")
-async def vitals_batch(request: Request):
-    """
-    Recebe payload do Power Automate e grava em:
-    - vitals_raw (todos os campos vitais)
-    - vitals_events (somente colunas existentes)
-    + (gancho) recommendations se existir tabela compatível
-    """
+async def vitals_batch(req: Request):
+    received_at = _now_ts()
+
     try:
-        payload = await request.json()
+        payload = await req.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Body precisa ser JSON.")
+        payload = None
 
-    rows_raw = extract_rows(payload)
-    received = len(rows_raw)
-
-    # debug_keys_sample (para te ajudar)
+    rows = _extract_rows(payload)
     debug_keys_sample = []
     if isinstance(payload, dict):
-        debug_keys_sample = list(payload.keys())[:8]
+        debug_keys_sample = list(payload.keys())[:10]
 
-    normalized_rows: List[Dict[str, Any]] = []
-    for rr in rows_raw:
-        nr = normalize_row(rr)
+    # Normalize all rows
+    normalized_rows_raw: List[Dict[str, Any]] = []
+    for r in rows:
+        nr = _normalize_row_keys(r)
+        normalized_rows_raw.append(nr)
 
-        # filtro mínimo: precisa reconhecer atendimento + horário
-        if nr.get("cod_atendimento") is None:
+    # Map rows to vitals schema (your Power BI columns)
+    vitals: List[Dict[str, Any]] = []
+    skipped = 0
+    skip_reasons: Dict[str, int] = {}
+
+    for r in normalized_rows_raw:
+        # cod_atendimento can appear as:
+        # - cod_atendimento
+        # - id (some PBI models use ID as atendimento)
+        cod_at = _to_int(_pick_first(r, "cod_atendimento", "id", "cod_atend", "codatendimento"))
+        if cod_at is None:
+            skipped += 1
+            skip_reasons["missing_cod_atendimento"] = skip_reasons.get("missing_cod_atendimento", 0) + 1
             continue
-        if nr.get("event_ts") is None:
-            continue
-        if nr.get("data_lanc") is None:
-            # tenta derivar do event_ts se existir
-            if nr.get("event_ts"):
-                nr["data_lanc"] = nr["event_ts"].date()
-        if nr.get("data_lanc") is None:
-            continue
-        if nr.get("event_key") is None:
-            nr["event_key"] = f'{nr["cod_atendimento"]}::{nr["event_ts"].isoformat()}'
 
-        normalized_rows.append(nr)
+        id_ricadpac = _to_int(_pick_first(r, "id_ricadpac", "ricadpac", "id_paciente", "idpaciente"))
 
-    normalized = len(normalized_rows)
-    if normalized == 0:
-        return {
-            "ok": True,
-            "queued": False,
-            "received": received,
-            "normalized": 0,
-            "inserted_raw": 0,
-            "inserted_events": 0,
-            "skipped": received,
-            "message": "Nenhuma linha passou na normalização. Payload não contém campos mínimos (ID/COD_ATENDIMENTO + DATA_LANC/HORA_LANC/MINUTO_LANC ou DATA_HORA_LANC_MINUTO).",
-            "debug_keys_sample": debug_keys_sample,
-            "version": APP_VERSION,
+        data_lanc = _parse_date(_pick_first(r, "data_lanc", "data", "dt", "data_hora_lanc_minuto"))
+        hora_lanc = _to_int(_pick_first(r, "hora_lanc", "hora"))
+        minuto_lanc = _to_int(_pick_first(r, "minuto_lanc", "minuto", "min"))
+
+        # If PBI has a datetime column, accept it
+        dt_full = _parse_datetime(_pick_first(r, "data_hora_lanc_minuto", "datahora", "event_ts", "timestamp"))
+        if dt_full and (data_lanc is None or hora_lanc is None or minuto_lanc is None):
+            data_lanc = data_lanc or dt_full.date()
+            hora_lanc = hora_lanc if hora_lanc is not None else dt_full.hour
+            minuto_lanc = minuto_lanc if minuto_lanc is not None else dt_full.minute
+
+        if data_lanc is None:
+            skipped += 1
+            skip_reasons["missing_data_lanc"] = skip_reasons.get("missing_data_lanc", 0) + 1
+            continue
+        if hora_lanc is None:
+            skipped += 1
+            skip_reasons["missing_hora_lanc"] = skip_reasons.get("missing_hora_lanc", 0) + 1
+            continue
+        if minuto_lanc is None:
+            skipped += 1
+            skip_reasons["missing_minuto_lanc"] = skip_reasons.get("missing_minuto_lanc", 0) + 1
+            continue
+
+        event_ts = _build_event_ts(data_lanc, hora_lanc, minuto_lanc)
+
+        v = {
+            "event_ts": event_ts,
+            "cod_atendimento": cod_at,
+            "id_ricadpac": id_ricadpac,
+            "data_lanc": data_lanc,
+            "hora_lanc": hora_lanc,
+            "minuto_lanc": minuto_lanc,
+            "temp": _to_float(_pick_first(r, "temp", "temperatura")),
+            "dor": _to_float(_pick_first(r, "dor")),
+            "fr": _to_float(_pick_first(r, "fr", "freq_respiratoria")),
+            "fc": _to_float(_pick_first(r, "fc", "freq_cardiaca")),
+            "pad": _to_float(_pick_first(r, "pad")),
+            "pas": _to_float(_pick_first(r, "pas")),
+            "spo2": _to_float(_pick_first(r, "spo2", "sao2", "sat")),
+            "uso_o2": _pick_first(r, "uso_o2", "uso2", "o2") ,
+            "nivel_consciencia": _pick_first(r, "nivel_consciencia", "nivel_consciencia_", "nivel"),
+            "profissional": _pick_first(r, "profissional"),
+            "received_at": received_at,
+            "source": "power_automate",
+            "payload": payload,
         }
 
-    warnings_all: List[str] = []
+        # Clean text fields
+        if isinstance(v["uso_o2"], str):
+            v["uso_o2"] = v["uso_o2"].strip()
+        if isinstance(v["nivel_consciencia"], str):
+            v["nivel_consciencia"] = v["nivel_consciencia"].strip()
+        if isinstance(v["profissional"], str):
+            v["profissional"] = v["profissional"].strip()
+
+        vitals.append(v)
+
+    if not vitals:
+        msg = "Nenhuma linha passou na normalização."
+        if skip_reasons.get("missing_cod_atendimento"):
+            msg = "Nenhuma linha passou na normalização. Payload não contém COD_ATENDIMENTO em formato reconhecido."
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "queued": False,
+                "received": len(rows),
+                "normalized": 0,
+                "skipped": skipped,
+                "skip_reasons": skip_reasons,
+                "message": msg,
+                "debug_keys_sample": debug_keys_sample,
+                "version": APP_VERSION,
+            },
+        )
+
+    # -----------------------------
+    # Write to DB (UPSERT)
+    # -----------------------------
+    inserted_raw = 0
+    updated_raw = 0
+    inserted_events = 0
+    updated_events = 0
+    risk_upserts = 0
+    telegram_sent = 0
+    telegram_errors: List[str] = []
 
     try:
-        with db_connect() as conn:
-            with conn.transaction():
-                # vitals_raw: grava tudo que existir na tabela
-                ins_raw, _, skip_raw, warn_raw = upsert_rows(conn, "vitals_raw", normalized_rows)
-                warnings_all.extend(warn_raw)
+        with _db_connect() as conn:
+            _ensure_indexes(conn)
 
-                # vitals_events: grava só o que existir (sem "data_lanc" se não existir)
-                ins_evt, _, skip_evt, warn_evt = upsert_rows(conn, "vitals_events", normalized_rows)
-                warnings_all.extend(warn_evt)
+            # Columns that exist in each table (avoid schema mismatch)
+            raw_cols = _get_table_columns(conn, "vitals_raw")
+            events_exists = _table_exists(conn, "vitals_events")
+            events_cols = _get_table_columns(conn, "vitals_events") if events_exists else []
+            risk_exists = _table_exists(conn, "risk_events")
+            risk_cols = _get_table_columns(conn, "risk_events") if risk_exists else []
 
-                # gancho: recomendações (se existir tabela compatível)
-                upsert_recommendations_if_exists(conn, normalized_rows)
+            # ---- UPSERT vitals_raw ----
+            # We'll upsert only columns that exist
+            raw_target_cols = [
+                c for c in [
+                    "event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "hora_lanc", "minuto_lanc",
+                    "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
+                    "uso_o2", "nivel_consciencia", "profissional",
+                    "received_at", "source", "payload",
+                    "updated_at",
+                ]
+                if c in raw_cols
+            ]
+
+            # updated_at: let DB default if exists; we set to now on updates
+            # But for insert we can omit updated_at; to keep simple, provide it if exists
+            for v in vitals:
+                if "updated_at" in raw_target_cols:
+                    v["updated_at"] = received_at
+
+            raw_placeholders = ", ".join([f"%({c})s" for c in raw_target_cols])
+            raw_columns_sql = ", ".join(raw_target_cols)
+
+            # ON CONFLICT requires unique index created above
+            # Update all non-key fields
+            raw_update_cols = [c for c in raw_target_cols if c not in ("cod_atendimento", "event_ts")]
+            raw_update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in raw_update_cols if c != "payload"])  # payload handled below
+            if "payload" in raw_update_cols:
+                # keep latest payload
+                raw_update_sql = (raw_update_sql + ", " if raw_update_sql else "") + "payload=EXCLUDED.payload"
+            if "updated_at" in raw_cols:
+                raw_update_sql = (raw_update_sql + ", " if raw_update_sql else "") + "updated_at=NOW()"
+
+            raw_sql = f"""
+                INSERT INTO vitals_raw ({raw_columns_sql})
+                VALUES ({raw_placeholders})
+                ON CONFLICT (cod_atendimento, event_ts)
+                DO UPDATE SET {raw_update_sql}
+            """
+
+            with conn.cursor() as cur:
+                # executemany is enough for your batch sizes
+                # We'll estimate inserted/updated by checking existing beforehand
+                # to produce meaningful counters.
+                cur.execute(
+                    "SELECT cod_atendimento, event_ts FROM vitals_raw WHERE (cod_atendimento, event_ts) = ANY(%s)",
+                    ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
+                )
+                existing = {(r["cod_atendimento"], r["event_ts"]) for r in cur.fetchall()}
+
+                cur.executemany(raw_sql, vitals)
+
+                inserted_raw = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing)
+                updated_raw = len(vitals) - inserted_raw
+
+            # ---- UPSERT vitals_events (if exists) ----
+            if events_exists:
+                # only insert columns that exist in vitals_events
+                events_target_cols = [
+                    c for c in [
+                        "event_ts", "cod_atendimento", "id_ricadpac",
+                        # some schemas may NOT have data_lanc/hora/minuto; we respect introspection
+                        "data_lanc", "hora_lanc", "minuto_lanc",
+                        "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
+                        "uso_o2", "nivel_consciencia", "profissional",
+                        "created_at",
+                    ]
+                    if c in events_cols
+                ]
+
+                # Provide created_at if exists and not default
+                for v in vitals:
+                    if "created_at" in events_target_cols and "created_at" not in v:
+                        v["created_at"] = received_at
+
+                events_placeholders = ", ".join([f"%({c})s" for c in events_target_cols])
+                events_columns_sql = ", ".join(events_target_cols)
+
+                # Ensure unique index for events too (best-effort)
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS vitals_events_cod_event_uq
+                        ON vitals_events (cod_atendimento, event_ts);
+                    """)
+
+                    cur.execute(
+                        "SELECT cod_atendimento, event_ts FROM vitals_events WHERE (cod_atendimento, event_ts) = ANY(%s)",
+                        ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
+                    )
+                    existing_e = {(r["cod_atendimento"], r["event_ts"]) for r in cur.fetchall()}
+
+                    update_cols = [c for c in events_target_cols if c not in ("cod_atendimento", "event_ts", "created_at")]
+                    update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
+
+                    events_sql = f"""
+                        INSERT INTO vitals_events ({events_columns_sql})
+                        VALUES ({events_placeholders})
+                        ON CONFLICT (cod_atendimento, event_ts)
+                        DO UPDATE SET {update_sql}
+                    """
+                    cur.executemany(events_sql, vitals)
+
+                    inserted_events = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing_e)
+                    updated_events = len(vitals) - inserted_events
+
+            # ---- RISK EVENTS (if exists) ----
+            critical_items: List[Dict[str, Any]] = []
+            if risk_exists:
+                risk_rows: List[Dict[str, Any]] = []
+                for v in vitals:
+                    level, score, reason = _compute_risk(v)
+                    rr = {
+                        "event_ts": v["event_ts"],
+                        "cod_atendimento": v["cod_atendimento"],
+                        "id_ricadpac": v.get("id_ricadpac"),
+                        "temp": v.get("temp"),
+                        "pas": v.get("pas"),
+                        "pad": v.get("pad"),
+                        "fc": v.get("fc"),
+                        "fr": v.get("fr"),
+                        "spo2": v.get("spo2"),
+                        "dor": v.get("dor"),
+                        "uso_o2": v.get("uso_o2"),
+                        "nivel_consciencia": v.get("nivel_consciencia"),
+                        "risk_level": level,
+                        "risk_score": score,
+                        "risk_reason": reason,
+                    }
+                    # keep only columns that exist
+                    rr = {k: rr[k] for k in rr.keys() if k in risk_cols}
+                    risk_rows.append(rr)
+
+                    if level == "CRITICO":
+                        critical_items.append({"v": v, "risk_score": score, "risk_reason": reason})
+
+                if risk_rows:
+                    risk_target_cols = list(risk_rows[0].keys())
+                    risk_cols_sql = ", ".join(risk_target_cols)
+                    risk_placeholders = ", ".join([f"%({c})s" for c in risk_target_cols])
+                    # risk_events has unique (cod_atendimento, event_ts)
+                    update_cols = [c for c in risk_target_cols if c not in ("cod_atendimento", "event_ts")]
+                    update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
+                    risk_sql = f"""
+                        INSERT INTO risk_events ({risk_cols_sql})
+                        VALUES ({risk_placeholders})
+                        ON CONFLICT (cod_atendimento, event_ts)
+                        DO UPDATE SET {update_sql}
+                    """
+                    with conn.cursor() as cur:
+                        cur.executemany(risk_sql, risk_rows)
+                    risk_upserts = len(risk_rows)
+
+            conn.commit()
+
+        # ---- Telegram (after commit) ----
+        # Send only for CRITICO
+        for item in critical_items:
+            v = item["v"]
+            msg = (
+                "🚨 PREVITA - PACIENTE CRÍTICO\n"
+                f"Atendimento: {v['cod_atendimento']}\n"
+                f"Evento: {v['event_ts']}\n"
+                f"Score: {item['risk_score']}\n"
+                f"Motivo: {item['risk_reason']}\n\n"
+                f"TEMP: {v.get('temp')}\n"
+                f"FC: {v.get('fc')} | FR: {v.get('fr')}\n"
+                f"PAS/PAD: {v.get('pas')}/{v.get('pad')}\n"
+                f"SpO2: {v.get('spo2')} | O2: {v.get('uso_o2')}\n"
+                f"Consciência: {v.get('nivel_consciencia')}\n"
+                f"Profissional: {v.get('profissional')}\n"
+            )
+            ok, info = _send_telegram_message(msg)
+            if ok:
+                telegram_sent += 1
+            else:
+                telegram_errors.append(info)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "queued": False,
+                "received": len(rows),
+                "normalized": len(vitals),
+                "skipped": skipped,
+                "skip_reasons": skip_reasons,
+                "vitals_raw": {"inserted": inserted_raw, "updated": updated_raw},
+                "vitals_events": {"exists": events_exists, "inserted": inserted_events, "updated": updated_events},
+                "risk_events": {"exists": risk_exists, "upserts": risk_upserts},
+                "telegram": {"sent": telegram_sent, "errors": telegram_errors[:5]},
+                "message": "Processado com UPSERT por (cod_atendimento,event_ts). Alterações no mesmo minuto atualizam a linha (não duplicam).",
+                "debug_keys_sample": debug_keys_sample,
+                "version": APP_VERSION,
+            },
+        )
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"ok": False, "error": str(e), "where": "/v1/vitals/batch", "version": APP_VERSION},
+            content={
+                "ok": False,
+                "error": str(e),
+                "where": "/v1/vitals/batch",
+                "version": APP_VERSION,
+            },
         )
-
-    # Se quiser: aqui você acopla o envio Telegram somente para CRITICO (não incluí token/chat por segurança)
-    # - Sugestão: enviar só quando houve mudança real (event_key novo/alterado)
-
-    msg = "Dados processados e gravados (raw + events)."
-    if warnings_all:
-        msg += " Com avisos: " + " | ".join(warnings_all[:3])  # limita
-
-    return {
-        "ok": True,
-        "queued": False,
-        "received": received,
-        "normalized": normalized,
-        "inserted_raw": ins_raw,
-        "inserted_events": ins_evt,
-        "skipped": max(0, received - normalized),
-        "message": msg,
-        "debug_keys_sample": debug_keys_sample,
-        "version": APP_VERSION,
-    }
