@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_VERSION = "4.1.2"  # bump para confirmar deploy e corrigir 500/ANY(tuple)
+APP_VERSION = "4.1.3"  # bump p/ confirmar deploy e corrigir 500 do ensure_indexes
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -27,28 +27,16 @@ def _now_ts() -> datetime:
 
 
 def _normalize_key(k: Any) -> str:
-    """
-    Normaliza chaves vindas do PowerBI/PowerAutomate.
-
-    Exemplos que resolve:
-    - "COD_ATENDIMENTO" -> "cod_atendimento"
-    - "[PAD]" -> "pad"
-    - "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]" -> "cod_atendimento"
-    - " Tabela [ COD_ATENDIMENTO ] " -> "cod_atendimento"
-    """
     if k is None:
         return ""
     s = str(k).strip()
 
-    # pega o último bloco [ ... ] se existir (caso Tabela[COLUNA])
     m = re.findall(r"\[([^\]]+)\]", s)
     if m:
         s = m[-1]
 
-    # remove colchetes restantes e limpa
     s = s.replace("[", "").replace("]", "").strip()
 
-    # normaliza separadores
     s = s.lower()
     s = re.sub(r"\s+", "_", s)
     s = s.replace("-", "_")
@@ -68,7 +56,6 @@ def _to_int(v: Any) -> Optional[int]:
     s = str(v).strip()
     if s == "" or s.lower() in ("nan", "none", "null"):
         return None
-    # remove thousand separators like "21.101,00" -> "21101"
     s2 = s.replace(".", "").replace(",", ".")
     try:
         f = float(s2)
@@ -86,7 +73,6 @@ def _to_float(v: Any) -> Optional[float]:
     s = str(v).strip()
     if s == "" or s.lower() in ("nan", "none", "null"):
         return None
-    # pt-BR: "36,5" -> 36.5 ; also handle "87,00"
     if re.search(r"\d+,\d+", s):
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -138,14 +124,6 @@ def _parse_datetime(v: Any) -> Optional[datetime]:
 
 
 def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Accepts many shapes:
-    - {"powerbi": {...}}
-    - {"results":[{"tables":[{"rows":[...] }]}]}
-    - {"tables":[{"rows":[...]}]}
-    - {"rows":[...]}
-    - [...]
-    """
     if payload is None:
         return []
 
@@ -210,29 +188,17 @@ def _db_connect():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
-def _ensure_indexes(conn) -> None:
+def _table_exists(conn, table: str, schema: str = "public") -> bool:
     with conn.cursor() as cur:
-        cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS vitals_raw_cod_event_uq
-        ON vitals_raw (cod_atendimento, event_ts);
-        """)
-        cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS risk_events_cod_event_uq
-        ON risk_events (cod_atendimento, event_ts);
-        """)
-        # vitals_events (se existir)
-        cur.execute("""
-        DO $$
-        BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.tables
-                WHERE table_schema='public' AND table_name='vitals_events'
-            ) THEN
-                EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS vitals_events_cod_event_uq ON vitals_events (cod_atendimento, event_ts);';
-            END IF;
-        END$$;
-        """)
-    conn.commit()
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema=%s AND table_name=%s
+            """,
+            (schema, table),
+        )
+        return cur.fetchone() is not None
 
 
 def _get_table_columns(conn, table: str, schema: str = "public") -> List[str]:
@@ -250,17 +216,37 @@ def _get_table_columns(conn, table: str, schema: str = "public") -> List[str]:
     return [r["column_name"] for r in rows]
 
 
-def _table_exists(conn, table: str, schema: str = "public") -> bool:
+def _ensure_indexes(conn) -> Dict[str, Any]:
+    """
+    Cria índices APENAS se a tabela existir.
+    Isso elimina 500 por "relation does not exist".
+    """
+    status = {"vitals_raw": False, "vitals_events": False, "risk_events": False}
+
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema=%s AND table_name=%s
-            """,
-            (schema, table),
-        )
-        return cur.fetchone() is not None
+        if _table_exists(conn, "vitals_raw"):
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS vitals_raw_cod_event_uq
+                ON vitals_raw (cod_atendimento, event_ts);
+            """)
+            status["vitals_raw"] = True
+
+        if _table_exists(conn, "vitals_events"):
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS vitals_events_cod_event_uq
+                ON vitals_events (cod_atendimento, event_ts);
+            """)
+            status["vitals_events"] = True
+
+        if _table_exists(conn, "risk_events"):
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS risk_events_cod_event_uq
+                ON risk_events (cod_atendimento, event_ts);
+            """)
+            status["risk_events"] = True
+
+    conn.commit()
+    return status
 
 
 # -----------------------------
@@ -344,11 +330,7 @@ def _send_telegram_message(text: str) -> Tuple[bool, str]:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        resp = requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10,
-        )
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
         if 200 <= resp.status_code < 300:
             return True, "ok"
         return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
@@ -376,6 +358,31 @@ def db_ping():
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e), "version": APP_VERSION})
 
 
+@app.post("/v1/debug/payload")
+async def debug_payload(req: Request):
+    """
+    Use isso 1x no Power Automate (temporariamente) para enxergar:
+    - chaves do payload raiz
+    - chaves do primeiro row (original e normalizado)
+    """
+    try:
+        payload = await req.json()
+    except Exception:
+        payload = None
+    rows = _extract_rows(payload)
+    debug_keys_sample = list(payload.keys())[:20] if isinstance(payload, dict) else []
+    first_orig = list(rows[0].keys())[:120] if rows and isinstance(rows[0], dict) else []
+    first_norm = list(_normalize_row_keys(rows[0]).keys())[:120] if rows and isinstance(rows[0], dict) else []
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "root_keys": debug_keys_sample,
+        "rows_found": len(rows),
+        "first_row_original_keys": first_orig,
+        "first_row_normalized_keys": first_norm,
+    }
+
+
 @app.post("/v1/vitals/batch")
 async def vitals_batch(req: Request):
     received_at = _now_ts()
@@ -387,22 +394,17 @@ async def vitals_batch(req: Request):
 
     rows = _extract_rows(payload)
 
-    # Debug das chaves do payload (nível raiz)
     debug_keys_sample = []
     if isinstance(payload, dict):
         debug_keys_sample = list(payload.keys())[:10]
 
-    # Debug das chaves do primeiro row
     debug_first_row_original_keys: List[str] = []
     debug_first_row_normalized_keys: List[str] = []
     if rows and isinstance(rows[0], dict):
         debug_first_row_original_keys = list(rows[0].keys())[:80]
         debug_first_row_normalized_keys = list(_normalize_row_keys(rows[0]).keys())[:80]
 
-    # Normalize all rows
-    normalized_rows_raw: List[Dict[str, Any]] = []
-    for r in rows:
-        normalized_rows_raw.append(_normalize_row_keys(r))
+    normalized_rows_raw = [_normalize_row_keys(r) for r in rows]
 
     vitals: List[Dict[str, Any]] = []
     skipped = 0
@@ -492,36 +494,31 @@ async def vitals_batch(req: Request):
         )
 
     inserted_raw = 0
-    updated_raw = 0
     inserted_events = 0
-    updated_events = 0
     risk_upserts = 0
     telegram_sent = 0
     telegram_errors: List[str] = []
 
     try:
         with _db_connect() as conn:
-            _ensure_indexes(conn)
+            idx_status = _ensure_indexes(conn)
 
-            raw_cols = _get_table_columns(conn, "vitals_raw")
+            raw_cols = _get_table_columns(conn, "vitals_raw") if _table_exists(conn, "vitals_raw") else []
             events_exists = _table_exists(conn, "vitals_events")
             events_cols = _get_table_columns(conn, "vitals_events") if events_exists else []
             risk_exists = _table_exists(conn, "risk_events")
             risk_cols = _get_table_columns(conn, "risk_events") if risk_exists else []
 
-            # -----------------------------
-            # UPSERT vitals_raw (SEM ANY(tuple) -> evita 500)
-            # -----------------------------
-            raw_target_cols = [
-                c for c in [
-                    "event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "hora_lanc", "minuto_lanc",
-                    "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
-                    "uso_o2", "nivel_consciencia", "profissional",
-                    "received_at", "source", "payload",
-                    "updated_at",
-                ]
-                if c in raw_cols
-            ]
+            if not raw_cols:
+                raise RuntimeError("Tabela vitals_raw não existe no banco apontado pelo DATABASE_URL.")
+
+            # UPSERT vitals_raw
+            raw_target_cols = [c for c in [
+                "event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "hora_lanc", "minuto_lanc",
+                "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
+                "uso_o2", "nivel_consciencia", "profissional",
+                "received_at", "source", "payload", "updated_at",
+            ] if c in raw_cols]
 
             for v in vitals:
                 if "updated_at" in raw_target_cols:
@@ -546,25 +543,17 @@ async def vitals_batch(req: Request):
 
             with conn.cursor() as cur:
                 cur.executemany(raw_sql, vitals)
-
-            # contadores simples (Postgres resolve insert/update via ON CONFLICT)
             inserted_raw = len(vitals)
-            updated_raw = 0
 
-            # -----------------------------
-            # UPSERT vitals_events (SEM ANY(tuple) -> evita 500)
-            # -----------------------------
+            # UPSERT vitals_events (se existir)
             if events_exists:
-                events_target_cols = [
-                    c for c in [
-                        "event_ts", "cod_atendimento", "id_ricadpac",
-                        "data_lanc", "hora_lanc", "minuto_lanc",
-                        "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
-                        "uso_o2", "nivel_consciencia", "profissional",
-                        "created_at",
-                    ]
-                    if c in events_cols
-                ]
+                events_target_cols = [c for c in [
+                    "event_ts", "cod_atendimento", "id_ricadpac",
+                    "data_lanc", "hora_lanc", "minuto_lanc",
+                    "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
+                    "uso_o2", "nivel_consciencia", "profissional",
+                    "created_at",
+                ] if c in events_cols]
 
                 for v in vitals:
                     if "created_at" in events_target_cols and "created_at" not in v:
@@ -585,13 +574,9 @@ async def vitals_batch(req: Request):
 
                 with conn.cursor() as cur:
                     cur.executemany(events_sql, vitals)
-
                 inserted_events = len(vitals)
-                updated_events = 0
 
-            # -----------------------------
-            # RISK EVENTS (baseline)
-            # -----------------------------
+            # RISK (se existir)
             critical_items: List[Dict[str, Any]] = []
             if risk_exists:
                 risk_rows: List[Dict[str, Any]] = []
@@ -626,6 +611,7 @@ async def vitals_batch(req: Request):
                     risk_placeholders = ", ".join([f"%({c})s" for c in risk_target_cols])
                     update_cols = [c for c in risk_target_cols if c not in ("cod_atendimento", "event_ts")]
                     update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
+
                     risk_sql = f"""
                         INSERT INTO risk_events ({risk_cols_sql})
                         VALUES ({risk_placeholders})
@@ -638,7 +624,7 @@ async def vitals_batch(req: Request):
 
             conn.commit()
 
-        # Telegram após commit
+        # Telegram depois do commit
         for item in critical_items:
             v = item["v"]
             msg = (
@@ -664,16 +650,16 @@ async def vitals_batch(req: Request):
             status_code=200,
             content={
                 "ok": True,
-                "queued": False,
                 "received": len(rows),
                 "normalized": len(vitals),
                 "skipped": skipped,
                 "skip_reasons": skip_reasons,
-                "vitals_raw": {"inserted": inserted_raw, "updated": updated_raw},
-                "vitals_events": {"exists": events_exists, "inserted": inserted_events, "updated": updated_events},
+                "indexes": idx_status,
+                "vitals_raw": {"upserts": inserted_raw},
+                "vitals_events": {"exists": events_exists, "upserts": inserted_events},
                 "risk_events": {"exists": risk_exists, "upserts": risk_upserts},
                 "telegram": {"sent": telegram_sent, "errors": telegram_errors[:5]},
-                "message": "Processado com UPSERT por (cod_atendimento,event_ts). Alterações no mesmo minuto atualizam a linha (não duplicam).",
+                "message": "UPSERT por (cod_atendimento,event_ts): se mudou no mesmo minuto, atualiza. Se mudou minuto/horário, cria novo evento.",
                 "debug_keys_sample": debug_keys_sample,
                 "debug_first_row_original_keys": debug_first_row_original_keys,
                 "debug_first_row_normalized_keys": debug_first_row_normalized_keys,
@@ -682,6 +668,7 @@ async def vitals_batch(req: Request):
         )
 
     except Exception as e:
+        # erro 500 com diagnóstico mais útil
         return JSONResponse(
             status_code=500,
             content={
