@@ -11,7 +11,7 @@ from psycopg.rows import dict_row
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-APP_VERSION = "4.1.1"  # bump para confirmar deploy
+APP_VERSION = "4.1.2"  # bump para confirmar deploy e corrigir 500/ANY(tuple)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -409,7 +409,6 @@ async def vitals_batch(req: Request):
     skip_reasons: Dict[str, int] = {}
 
     for r in normalized_rows_raw:
-        # Agora reconhece também "tabela[cod_atendimento]" etc
         cod_at = _to_int(_pick_first(r, "cod_atendimento", "id", "cod_atend", "codatendimento"))
         if cod_at is None:
             skipped += 1
@@ -422,7 +421,6 @@ async def vitals_batch(req: Request):
         hora_lanc = _to_int(_pick_first(r, "hora_lanc", "hora"))
         minuto_lanc = _to_int(_pick_first(r, "minuto_lanc", "minuto", "min"))
 
-        # Se vier datetime completo, usa como fallback
         dt_full = _parse_datetime(_pick_first(r, "data_hora_lanc_minuto", "datahora", "event_ts", "timestamp"))
         if dt_full and (data_lanc is None or hora_lanc is None or minuto_lanc is None):
             data_lanc = data_lanc or dt_full.date()
@@ -466,7 +464,6 @@ async def vitals_batch(req: Request):
             "payload": payload,
         }
 
-        # Clean text fields
         for tf in ("uso_o2", "nivel_consciencia", "profissional"):
             if isinstance(v.get(tf), str):
                 v[tf] = v[tf].strip()
@@ -512,6 +509,9 @@ async def vitals_batch(req: Request):
             risk_exists = _table_exists(conn, "risk_events")
             risk_cols = _get_table_columns(conn, "risk_events") if risk_exists else []
 
+            # -----------------------------
+            # UPSERT vitals_raw (SEM ANY(tuple) -> evita 500)
+            # -----------------------------
             raw_target_cols = [
                 c for c in [
                     "event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "hora_lanc", "minuto_lanc",
@@ -545,17 +545,15 @@ async def vitals_batch(req: Request):
             """
 
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT cod_atendimento, event_ts FROM vitals_raw WHERE (cod_atendimento, event_ts) = ANY(%s)",
-                    ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
-                )
-                existing = {(r["cod_atendimento"], r["event_ts"]) for r in cur.fetchall()}
-
                 cur.executemany(raw_sql, vitals)
 
-                inserted_raw = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing)
-                updated_raw = len(vitals) - inserted_raw
+            # contadores simples (Postgres resolve insert/update via ON CONFLICT)
+            inserted_raw = len(vitals)
+            updated_raw = 0
 
+            # -----------------------------
+            # UPSERT vitals_events (SEM ANY(tuple) -> evita 500)
+            # -----------------------------
             if events_exists:
                 events_target_cols = [
                     c for c in [
@@ -575,27 +573,25 @@ async def vitals_batch(req: Request):
                 events_placeholders = ", ".join([f"%({c})s" for c in events_target_cols])
                 events_columns_sql = ", ".join(events_target_cols)
 
+                update_cols = [c for c in events_target_cols if c not in ("cod_atendimento", "event_ts", "created_at")]
+                update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
+
+                events_sql = f"""
+                    INSERT INTO vitals_events ({events_columns_sql})
+                    VALUES ({events_placeholders})
+                    ON CONFLICT (cod_atendimento, event_ts)
+                    DO UPDATE SET {update_sql}
+                """
+
                 with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT cod_atendimento, event_ts FROM vitals_events WHERE (cod_atendimento, event_ts) = ANY(%s)",
-                        ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
-                    )
-                    existing_e = {(r["cod_atendimento"], r["event_ts"]) for r in cur.fetchall()}
-
-                    update_cols = [c for c in events_target_cols if c not in ("cod_atendimento", "event_ts", "created_at")]
-                    update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
-
-                    events_sql = f"""
-                        INSERT INTO vitals_events ({events_columns_sql})
-                        VALUES ({events_placeholders})
-                        ON CONFLICT (cod_atendimento, event_ts)
-                        DO UPDATE SET {update_sql}
-                    """
                     cur.executemany(events_sql, vitals)
 
-                    inserted_events = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing_e)
-                    updated_events = len(vitals) - inserted_events
+                inserted_events = len(vitals)
+                updated_events = 0
 
+            # -----------------------------
+            # RISK EVENTS (baseline)
+            # -----------------------------
             critical_items: List[Dict[str, Any]] = []
             if risk_exists:
                 risk_rows: List[Dict[str, Any]] = []
@@ -642,6 +638,7 @@ async def vitals_batch(req: Request):
 
             conn.commit()
 
+        # Telegram após commit
         for item in critical_items:
             v = item["v"]
             msg = (
