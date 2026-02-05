@@ -10,39 +10,14 @@ import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import re
 
-def canonical_key(k: str) -> str:
-    if k is None:
-        return ""
-    k = str(k).strip()
-
-    # Se vier "Tabela[COLUNA]" pega a parte COLUNA
-    m = re.findall(r"\[([^\]]+)\]", k)
-    if m:
-        k = m[-1]  # pega o último [ ... ]
-
-    # Remove colchetes soltos e espaços
-    k = k.replace("[", "").replace("]", "").strip()
-
-    # Padroniza
-    return k.upper()
-
-def normalize_row_keys(row: dict) -> dict:
-    out = {}
-    for k, v in (row or {}).items():
-        out[canonical_key(k)] = v
-    return out
-
-
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"  # bump para confirmar deploy
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 app = FastAPI(title="PREVITA API", version=APP_VERSION)
-
 
 # -----------------------------
 # Helpers: parsing & normalize
@@ -51,15 +26,34 @@ def _now_ts() -> datetime:
     return datetime.utcnow()
 
 
-def _strip_brackets_key(k: str) -> str:
-    # "[PAD]" -> "pad", " COD_ATENDIMENTO " -> "cod_atendimento"
-    k = k.strip()
-    if k.startswith("[") and k.endswith("]"):
-        k = k[1:-1]
-    k = k.strip().lower()
-    k = re.sub(r"\s+", "_", k)
-    k = k.replace("-", "_")
-    return k
+def _normalize_key(k: Any) -> str:
+    """
+    Normaliza chaves vindas do PowerBI/PowerAutomate.
+
+    Exemplos que resolve:
+    - "COD_ATENDIMENTO" -> "cod_atendimento"
+    - "[PAD]" -> "pad"
+    - "VW_PREVITA_VITAIS_AGRUPADOS[COD_ATENDIMENTO]" -> "cod_atendimento"
+    - " Tabela [ COD_ATENDIMENTO ] " -> "cod_atendimento"
+    """
+    if k is None:
+        return ""
+    s = str(k).strip()
+
+    # pega o último bloco [ ... ] se existir (caso Tabela[COLUNA])
+    m = re.findall(r"\[([^\]]+)\]", s)
+    if m:
+        s = m[-1]
+
+    # remove colchetes restantes e limpa
+    s = s.replace("[", "").replace("]", "").strip()
+
+    # normaliza separadores
+    s = s.lower()
+    s = re.sub(r"\s+", "_", s)
+    s = s.replace("-", "_")
+    s = re.sub(r"__+", "_", s)
+    return s
 
 
 def _to_int(v: Any) -> Optional[int]:
@@ -75,12 +69,11 @@ def _to_int(v: Any) -> Optional[int]:
     if s == "" or s.lower() in ("nan", "none", "null"):
         return None
     # remove thousand separators like "21.101,00" -> "21101"
-    s = s.replace(".", "").replace(",", ".")
+    s2 = s.replace(".", "").replace(",", ".")
     try:
-        f = float(s)
+        f = float(s2)
         return int(f)
     except Exception:
-        # last try: keep only digits
         digits = re.sub(r"\D+", "", s)
         return int(digits) if digits else None
 
@@ -94,7 +87,10 @@ def _to_float(v: Any) -> Optional[float]:
     if s == "" or s.lower() in ("nan", "none", "null"):
         return None
     # pt-BR: "36,5" -> 36.5 ; also handle "87,00"
-    s = s.replace(".", "").replace(",", ".") if re.search(r"\d+,\d+", s) else s.replace(",", ".")
+    if re.search(r"\d+,\d+", s):
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
     try:
         return float(s)
     except Exception:
@@ -111,13 +107,11 @@ def _parse_date(v: Any) -> Optional[date]:
     s = str(v).strip()
     if not s:
         return None
-    # Common: "2026-02-03T00:00:00" or "2026-02-03"
     s = s.replace("T", " ")
     try:
         return datetime.fromisoformat(s).date()
     except Exception:
         pass
-    # dd/mm/yyyy
     m = re.match(r"^(\d{2})/(\d{2})/(\d{4})", s)
     if m:
         dd, mm, yyyy = m.groups()
@@ -155,23 +149,18 @@ def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
         return []
 
-    # If payload is bytes or string JSON
     if isinstance(payload, (bytes, str)):
         try:
             payload = json.loads(payload)
         except Exception:
             return []
 
-    # Power Automate often wraps user json in {"powerbi": <PBI OUTPUT>}
     if isinstance(payload, dict) and "powerbi" in payload:
         return _extract_rows(payload["powerbi"])
 
-    # Direct rows
     if isinstance(payload, dict) and "rows" in payload and isinstance(payload["rows"], list):
-        rows = payload["rows"]
-        return [r for r in rows if isinstance(r, dict)]
+        return [r for r in payload["rows"] if isinstance(r, dict)]
 
-    # tables -> rows
     if isinstance(payload, dict) and "tables" in payload and isinstance(payload["tables"], list):
         all_rows: List[Dict[str, Any]] = []
         for t in payload["tables"]:
@@ -179,7 +168,6 @@ def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
                 all_rows.extend([r for r in t["rows"] if isinstance(r, dict)])
         return all_rows
 
-    # results -> tables -> rows (PowerBI connector output)
     if isinstance(payload, dict) and "results" in payload and isinstance(payload["results"], list):
         all_rows: List[Dict[str, Any]] = []
         for res in payload["results"]:
@@ -189,7 +177,6 @@ def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
                         all_rows.extend([r for r in t["rows"] if isinstance(r, dict)])
         return all_rows
 
-    # Sometimes payload is list of dict already
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
 
@@ -198,8 +185,8 @@ def _extract_rows(payload: Any) -> List[Dict[str, Any]]:
 
 def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    for k, v in row.items():
-        out[_strip_brackets_key(str(k))] = v
+    for k, v in (row or {}).items():
+        out[_normalize_key(k)] = v
     return out
 
 
@@ -211,7 +198,6 @@ def _pick_first(d: Dict[str, Any], *keys: str) -> Any:
 
 
 def _build_event_ts(data_lanc: date, hora_lanc: int, minuto_lanc: int) -> datetime:
-    # event_ts in DB is TIMESTAMP (no tz). We'll store UTC-naive datetime.
     return datetime.combine(data_lanc, time(hour=hora_lanc, minute=minuto_lanc, second=0))
 
 
@@ -221,21 +207,30 @@ def _build_event_ts(data_lanc: date, hora_lanc: int, minuto_lanc: int) -> dateti
 def _db_connect():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada.")
-    # psycopg3: just connect using conninfo string
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def _ensure_indexes(conn) -> None:
-    # Make vitals_raw UPSERT-safe
     with conn.cursor() as cur:
         cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS vitals_raw_cod_event_uq
         ON vitals_raw (cod_atendimento, event_ts);
         """)
-        # (risk_events already has unique, but safe to ensure)
         cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS risk_events_cod_event_uq
         ON risk_events (cod_atendimento, event_ts);
+        """)
+        # vitals_events (se existir)
+        cur.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='vitals_events'
+            ) THEN
+                EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS vitals_events_cod_event_uq ON vitals_events (cod_atendimento, event_ts);';
+            END IF;
+        END$$;
         """)
     conn.commit()
 
@@ -272,10 +267,6 @@ def _table_exists(conn, table: str, schema: str = "public") -> bool:
 # Risk logic (baseline)
 # -----------------------------
 def _compute_risk(v: Dict[str, Any]) -> Tuple[str, int, str]:
-    """
-    Baseline rules. (Você pode trocar pela IA depois.)
-    Returns: risk_level, risk_score, reason
-    """
     score = 0
     reasons = []
 
@@ -320,10 +311,9 @@ def _compute_risk(v: Dict[str, Any]) -> Tuple[str, int, str]:
             score += 2
             reasons.append("PAS < 100")
 
-    if pad is not None:
-        if pad < 60:
-            score += 2
-            reasons.append("PAD < 60")
+    if pad is not None and pad < 60:
+        score += 2
+        reasons.append("PAD < 60")
 
     if temp is not None:
         if temp >= 39.0 or temp < 35.0:
@@ -359,7 +349,7 @@ def _send_telegram_message(text: str) -> Tuple[bool, str]:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=10,
         )
-        if resp.status_code >= 200 and resp.status_code < 300:
+        if 200 <= resp.status_code < 300:
             return True, "ok"
         return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
     except Exception as e:
@@ -396,25 +386,30 @@ async def vitals_batch(req: Request):
         payload = None
 
     rows = _extract_rows(payload)
+
+    # Debug das chaves do payload (nível raiz)
     debug_keys_sample = []
     if isinstance(payload, dict):
         debug_keys_sample = list(payload.keys())[:10]
 
+    # Debug das chaves do primeiro row
+    debug_first_row_original_keys: List[str] = []
+    debug_first_row_normalized_keys: List[str] = []
+    if rows and isinstance(rows[0], dict):
+        debug_first_row_original_keys = list(rows[0].keys())[:80]
+        debug_first_row_normalized_keys = list(_normalize_row_keys(rows[0]).keys())[:80]
+
     # Normalize all rows
     normalized_rows_raw: List[Dict[str, Any]] = []
     for r in rows:
-        nr = _normalize_row_keys(r)
-        normalized_rows_raw.append(nr)
+        normalized_rows_raw.append(_normalize_row_keys(r))
 
-    # Map rows to vitals schema (your Power BI columns)
     vitals: List[Dict[str, Any]] = []
     skipped = 0
     skip_reasons: Dict[str, int] = {}
 
     for r in normalized_rows_raw:
-        # cod_atendimento can appear as:
-        # - cod_atendimento
-        # - id (some PBI models use ID as atendimento)
+        # Agora reconhece também "tabela[cod_atendimento]" etc
         cod_at = _to_int(_pick_first(r, "cod_atendimento", "id", "cod_atend", "codatendimento"))
         if cod_at is None:
             skipped += 1
@@ -423,11 +418,11 @@ async def vitals_batch(req: Request):
 
         id_ricadpac = _to_int(_pick_first(r, "id_ricadpac", "ricadpac", "id_paciente", "idpaciente"))
 
-        data_lanc = _parse_date(_pick_first(r, "data_lanc", "data", "dt", "data_hora_lanc_minuto"))
+        data_lanc = _parse_date(_pick_first(r, "data_lanc", "data"))
         hora_lanc = _to_int(_pick_first(r, "hora_lanc", "hora"))
         minuto_lanc = _to_int(_pick_first(r, "minuto_lanc", "minuto", "min"))
 
-        # If PBI has a datetime column, accept it
+        # Se vier datetime completo, usa como fallback
         dt_full = _parse_datetime(_pick_first(r, "data_hora_lanc_minuto", "datahora", "event_ts", "timestamp"))
         if dt_full and (data_lanc is None or hora_lanc is None or minuto_lanc is None):
             data_lanc = data_lanc or dt_full.date()
@@ -463,8 +458,8 @@ async def vitals_batch(req: Request):
             "pad": _to_float(_pick_first(r, "pad")),
             "pas": _to_float(_pick_first(r, "pas")),
             "spo2": _to_float(_pick_first(r, "spo2", "sao2", "sat")),
-            "uso_o2": _pick_first(r, "uso_o2", "uso2", "o2") ,
-            "nivel_consciencia": _pick_first(r, "nivel_consciencia", "nivel_consciencia_", "nivel"),
+            "uso_o2": _pick_first(r, "uso_o2", "uso2", "o2"),
+            "nivel_consciencia": _pick_first(r, "nivel_consciencia", "nivel", "nivel_consciencia_"),
             "profissional": _pick_first(r, "profissional"),
             "received_at": received_at,
             "source": "power_automate",
@@ -472,12 +467,9 @@ async def vitals_batch(req: Request):
         }
 
         # Clean text fields
-        if isinstance(v["uso_o2"], str):
-            v["uso_o2"] = v["uso_o2"].strip()
-        if isinstance(v["nivel_consciencia"], str):
-            v["nivel_consciencia"] = v["nivel_consciencia"].strip()
-        if isinstance(v["profissional"], str):
-            v["profissional"] = v["profissional"].strip()
+        for tf in ("uso_o2", "nivel_consciencia", "profissional"):
+            if isinstance(v.get(tf), str):
+                v[tf] = v[tf].strip()
 
         vitals.append(v)
 
@@ -496,13 +488,12 @@ async def vitals_batch(req: Request):
                 "skip_reasons": skip_reasons,
                 "message": msg,
                 "debug_keys_sample": debug_keys_sample,
+                "debug_first_row_original_keys": debug_first_row_original_keys,
+                "debug_first_row_normalized_keys": debug_first_row_normalized_keys,
                 "version": APP_VERSION,
             },
         )
 
-    # -----------------------------
-    # Write to DB (UPSERT)
-    # -----------------------------
     inserted_raw = 0
     updated_raw = 0
     inserted_events = 0
@@ -515,15 +506,12 @@ async def vitals_batch(req: Request):
         with _db_connect() as conn:
             _ensure_indexes(conn)
 
-            # Columns that exist in each table (avoid schema mismatch)
             raw_cols = _get_table_columns(conn, "vitals_raw")
             events_exists = _table_exists(conn, "vitals_events")
             events_cols = _get_table_columns(conn, "vitals_events") if events_exists else []
             risk_exists = _table_exists(conn, "risk_events")
             risk_cols = _get_table_columns(conn, "risk_events") if risk_exists else []
 
-            # ---- UPSERT vitals_raw ----
-            # We'll upsert only columns that exist
             raw_target_cols = [
                 c for c in [
                     "event_ts", "cod_atendimento", "id_ricadpac", "data_lanc", "hora_lanc", "minuto_lanc",
@@ -535,8 +523,6 @@ async def vitals_batch(req: Request):
                 if c in raw_cols
             ]
 
-            # updated_at: let DB default if exists; we set to now on updates
-            # But for insert we can omit updated_at; to keep simple, provide it if exists
             for v in vitals:
                 if "updated_at" in raw_target_cols:
                     v["updated_at"] = received_at
@@ -544,12 +530,9 @@ async def vitals_batch(req: Request):
             raw_placeholders = ", ".join([f"%({c})s" for c in raw_target_cols])
             raw_columns_sql = ", ".join(raw_target_cols)
 
-            # ON CONFLICT requires unique index created above
-            # Update all non-key fields
             raw_update_cols = [c for c in raw_target_cols if c not in ("cod_atendimento", "event_ts")]
-            raw_update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in raw_update_cols if c != "payload"])  # payload handled below
+            raw_update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in raw_update_cols if c != "payload"])
             if "payload" in raw_update_cols:
-                # keep latest payload
                 raw_update_sql = (raw_update_sql + ", " if raw_update_sql else "") + "payload=EXCLUDED.payload"
             if "updated_at" in raw_cols:
                 raw_update_sql = (raw_update_sql + ", " if raw_update_sql else "") + "updated_at=NOW()"
@@ -562,9 +545,6 @@ async def vitals_batch(req: Request):
             """
 
             with conn.cursor() as cur:
-                # executemany is enough for your batch sizes
-                # We'll estimate inserted/updated by checking existing beforehand
-                # to produce meaningful counters.
                 cur.execute(
                     "SELECT cod_atendimento, event_ts FROM vitals_raw WHERE (cod_atendimento, event_ts) = ANY(%s)",
                     ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
@@ -576,13 +556,10 @@ async def vitals_batch(req: Request):
                 inserted_raw = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing)
                 updated_raw = len(vitals) - inserted_raw
 
-            # ---- UPSERT vitals_events (if exists) ----
             if events_exists:
-                # only insert columns that exist in vitals_events
                 events_target_cols = [
                     c for c in [
                         "event_ts", "cod_atendimento", "id_ricadpac",
-                        # some schemas may NOT have data_lanc/hora/minuto; we respect introspection
                         "data_lanc", "hora_lanc", "minuto_lanc",
                         "temp", "dor", "fr", "fc", "pad", "pas", "spo2",
                         "uso_o2", "nivel_consciencia", "profissional",
@@ -591,7 +568,6 @@ async def vitals_batch(req: Request):
                     if c in events_cols
                 ]
 
-                # Provide created_at if exists and not default
                 for v in vitals:
                     if "created_at" in events_target_cols and "created_at" not in v:
                         v["created_at"] = received_at
@@ -599,13 +575,7 @@ async def vitals_batch(req: Request):
                 events_placeholders = ", ".join([f"%({c})s" for c in events_target_cols])
                 events_columns_sql = ", ".join(events_target_cols)
 
-                # Ensure unique index for events too (best-effort)
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE UNIQUE INDEX IF NOT EXISTS vitals_events_cod_event_uq
-                        ON vitals_events (cod_atendimento, event_ts);
-                    """)
-
                     cur.execute(
                         "SELECT cod_atendimento, event_ts FROM vitals_events WHERE (cod_atendimento, event_ts) = ANY(%s)",
                         ([(v["cod_atendimento"], v["event_ts"]) for v in vitals],),
@@ -626,7 +596,6 @@ async def vitals_batch(req: Request):
                     inserted_events = sum(1 for v in vitals if (v["cod_atendimento"], v["event_ts"]) not in existing_e)
                     updated_events = len(vitals) - inserted_events
 
-            # ---- RISK EVENTS (if exists) ----
             critical_items: List[Dict[str, Any]] = []
             if risk_exists:
                 risk_rows: List[Dict[str, Any]] = []
@@ -649,7 +618,6 @@ async def vitals_batch(req: Request):
                         "risk_score": score,
                         "risk_reason": reason,
                     }
-                    # keep only columns that exist
                     rr = {k: rr[k] for k in rr.keys() if k in risk_cols}
                     risk_rows.append(rr)
 
@@ -660,7 +628,6 @@ async def vitals_batch(req: Request):
                     risk_target_cols = list(risk_rows[0].keys())
                     risk_cols_sql = ", ".join(risk_target_cols)
                     risk_placeholders = ", ".join([f"%({c})s" for c in risk_target_cols])
-                    # risk_events has unique (cod_atendimento, event_ts)
                     update_cols = [c for c in risk_target_cols if c not in ("cod_atendimento", "event_ts")]
                     update_sql = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else "event_ts=EXCLUDED.event_ts"
                     risk_sql = f"""
@@ -675,8 +642,6 @@ async def vitals_batch(req: Request):
 
             conn.commit()
 
-        # ---- Telegram (after commit) ----
-        # Send only for CRITICO
         for item in critical_items:
             v = item["v"]
             msg = (
@@ -713,6 +678,8 @@ async def vitals_batch(req: Request):
                 "telegram": {"sent": telegram_sent, "errors": telegram_errors[:5]},
                 "message": "Processado com UPSERT por (cod_atendimento,event_ts). Alterações no mesmo minuto atualizam a linha (não duplicam).",
                 "debug_keys_sample": debug_keys_sample,
+                "debug_first_row_original_keys": debug_first_row_original_keys,
+                "debug_first_row_normalized_keys": debug_first_row_normalized_keys,
                 "version": APP_VERSION,
             },
         )
@@ -727,5 +694,3 @@ async def vitals_batch(req: Request):
                 "version": APP_VERSION,
             },
         )
-
-
