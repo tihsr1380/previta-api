@@ -7,11 +7,11 @@ from typing import Any, Dict, List
 import psycopg
 from psycopg.rows import dict_row
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -73,17 +73,16 @@ def parse_date(v):
         return v
     if v is None:
         return None
+
     s = str(v).strip()
     if not s:
         return None
 
-    # tenta ISO completo
     try:
         return datetime.fromisoformat(s).date()
     except Exception:
         pass
 
-    # tenta só data
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -131,14 +130,18 @@ def extract_rows(payload: Any) -> List[Dict]:
 # ---------------- DB ----------------
 
 def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurado")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 # ---------------- TELEGRAM ----------------
 
 def telegram_send(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID não configurado")
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID não configurado")
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(
@@ -149,7 +152,12 @@ def telegram_send(text: str):
         },
         timeout=30
     )
-    resp.raise_for_status()
+
+    # Se der erro, devolve o detalhe do Telegram
+    if not resp.ok:
+        raise RuntimeError(f"Erro Telegram: status={resp.status_code}, body={resp.text}")
+
+    return resp.json()
 
 
 def format_alert(row: Dict[str, Any]) -> str:
@@ -171,31 +179,58 @@ def format_alert(row: Dict[str, Any]) -> str:
 
 
 def fetch_pending_telegram_alerts(max_send: int = 3):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT *
-            FROM public.telegram_alert_queue
-            ORDER BY snapshot_ts ASC
-            LIMIT %s
-            """,
-            (max_send,)
-        )
-        return cur.fetchall()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cod_atendimento,
+                    snapshot_ts,
+                    temp,
+                    pas,
+                    pad,
+                    fc,
+                    fr,
+                    spo2,
+                    dor,
+                    uso_o2,
+                    nivel_consciencia,
+                    profissional,
+                    alerta
+                FROM public.telegram_alert_queue
+                ORDER BY snapshot_ts ASC
+                LIMIT %s
+                """,
+                (max_send,)
+            )
+            rows = cur.fetchall()
+
+            # Com dict_row, rows já costumam vir como dict.
+            # Mas garantimos compatibilidade.
+            result = []
+            for r in rows:
+                if isinstance(r, dict):
+                    result.append(r)
+                else:
+                    cols = [desc[0] for desc in cur.description]
+                    result.append(dict(zip(cols, r)))
+
+            return result
 
 
 def mark_alert_sent(cod_atendimento: int, snapshot_ts: datetime, alerta: str):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO public.telegram_alert_log
-            (cod_atendimento, snapshot_ts, alerta)
-            VALUES (%s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            (cod_atendimento, snapshot_ts, alerta)
-        )
-        conn.commit()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.telegram_alert_log
+                (cod_atendimento, snapshot_ts, alerta)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (cod_atendimento, snapshot_ts, alerta)
+            )
+            conn.commit()
 
 
 # ---------------- API BASICA ----------------
@@ -213,7 +248,10 @@ def root():
 def health():
     return {
         "ok": True,
-        "version": APP_VERSION
+        "version": APP_VERSION,
+        "database_configured": bool(DATABASE_URL),
+        "telegram_token_configured": bool(TELEGRAM_BOT_TOKEN),
+        "telegram_chat_configured": bool(TELEGRAM_CHAT_ID)
     }
 
 
@@ -242,10 +280,6 @@ async def vitals_batch(req: Request):
         if not (d and h is not None and m is not None):
             skipped += 1
             continue
-
-        dt_min = parse_dt(r.get("data_hora_lanc_minuto"))
-        if dt_min is None:
-            dt_min = build_event_ts(d, h, m)
 
         normalized.append({
             "event_ts": build_event_ts(d, h, m),
@@ -278,76 +312,77 @@ async def vitals_batch(req: Request):
             "version": APP_VERSION
         }
 
-    with db() as conn, conn.cursor() as cur:
-        cur.executemany(
-            """
-            INSERT INTO public.vitals_raw (
-                event_ts,
-                cod_atendimento,
-                id_ricadpac,
-                data_lanc,
-                hora_lanc,
-                minuto_lanc,
-                temp,
-                dor,
-                fr,
-                fc,
-                pad,
-                pas,
-                spo2,
-                uso_o2,
-                nivel_consciencia,
-                profissional,
-                received_at,
-                source,
-                payload
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO public.vitals_raw (
+                    event_ts,
+                    cod_atendimento,
+                    id_ricadpac,
+                    data_lanc,
+                    hora_lanc,
+                    minuto_lanc,
+                    temp,
+                    dor,
+                    fr,
+                    fc,
+                    pad,
+                    pas,
+                    spo2,
+                    uso_o2,
+                    nivel_consciencia,
+                    profissional,
+                    received_at,
+                    source,
+                    payload
+                )
+                VALUES (
+                    %(event_ts)s,
+                    %(cod_atendimento)s,
+                    %(id_ricadpac)s,
+                    %(data_lanc)s,
+                    %(hora_lanc)s,
+                    %(minuto_lanc)s,
+                    %(temp)s,
+                    %(dor)s,
+                    %(fr)s,
+                    %(fc)s,
+                    %(pad)s,
+                    %(pas)s,
+                    %(spo2)s,
+                    %(uso_o2)s,
+                    %(nivel_consciencia)s,
+                    %(profissional)s,
+                    %(received_at)s,
+                    %(source)s,
+                    %(payload)s
+                )
+                ON CONFLICT (cod_atendimento, data_lanc, hora_lanc, minuto_lanc)
+                DO UPDATE SET
+                    event_ts = COALESCE(EXCLUDED.event_ts, vitals_raw.event_ts),
+                    id_ricadpac = COALESCE(EXCLUDED.id_ricadpac, vitals_raw.id_ricadpac),
+                    temp = COALESCE(EXCLUDED.temp, vitals_raw.temp),
+                    dor = COALESCE(EXCLUDED.dor, vitals_raw.dor),
+                    fr = COALESCE(EXCLUDED.fr, vitals_raw.fr),
+                    fc = COALESCE(EXCLUDED.fc, vitals_raw.fc),
+                    pad = COALESCE(EXCLUDED.pad, vitals_raw.pad),
+                    pas = COALESCE(EXCLUDED.pas, vitals_raw.pas),
+                    spo2 = COALESCE(EXCLUDED.spo2, vitals_raw.spo2),
+                    uso_o2 = COALESCE(EXCLUDED.uso_o2, vitals_raw.uso_o2),
+                    nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_raw.nivel_consciencia),
+                    profissional = COALESCE(EXCLUDED.profissional, vitals_raw.profissional),
+                    received_at = COALESCE(EXCLUDED.received_at, vitals_raw.received_at),
+                    source = COALESCE(EXCLUDED.source, vitals_raw.source),
+                    payload = COALESCE(EXCLUDED.payload, vitals_raw.payload),
+                    updated_at = NOW()
+                """,
+                normalized
             )
-            VALUES (
-                %(event_ts)s,
-                %(cod_atendimento)s,
-                %(id_ricadpac)s,
-                %(data_lanc)s,
-                %(hora_lanc)s,
-                %(minuto_lanc)s,
-                %(temp)s,
-                %(dor)s,
-                %(fr)s,
-                %(fc)s,
-                %(pad)s,
-                %(pas)s,
-                %(spo2)s,
-                %(uso_o2)s,
-                %(nivel_consciencia)s,
-                %(profissional)s,
-                %(received_at)s,
-                %(source)s,
-                %(payload)s
-            )
-            ON CONFLICT (cod_atendimento, data_lanc, hora_lanc, minuto_lanc)
-            DO UPDATE SET
-                event_ts = COALESCE(EXCLUDED.event_ts, vitals_raw.event_ts),
-                id_ricadpac = COALESCE(EXCLUDED.id_ricadpac, vitals_raw.id_ricadpac),
-                temp = COALESCE(EXCLUDED.temp, vitals_raw.temp),
-                dor = COALESCE(EXCLUDED.dor, vitals_raw.dor),
-                fr = COALESCE(EXCLUDED.fr, vitals_raw.fr),
-                fc = COALESCE(EXCLUDED.fc, vitals_raw.fc),
-                pad = COALESCE(EXCLUDED.pad, vitals_raw.pad),
-                pas = COALESCE(EXCLUDED.pas, vitals_raw.pas),
-                spo2 = COALESCE(EXCLUDED.spo2, vitals_raw.spo2),
-                uso_o2 = COALESCE(EXCLUDED.uso_o2, vitals_raw.uso_o2),
-                nivel_consciencia = COALESCE(EXCLUDED.nivel_consciencia, vitals_raw.nivel_consciencia),
-                profissional = COALESCE(EXCLUDED.profissional, vitals_raw.profissional),
-                received_at = COALESCE(EXCLUDED.received_at, vitals_raw.received_at),
-                source = COALESCE(EXCLUDED.source, vitals_raw.source),
-                payload = COALESCE(EXCLUDED.payload, vitals_raw.payload),
-                updated_at = NOW()
-            """,
-            normalized
-        )
 
-        # atualiza snapshot consolidado após ingestão
-        cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
-        conn.commit()
+            # atualiza snapshot consolidado após ingestão
+            cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
+            conn.commit()
 
     return {
         "ok": True,
@@ -362,9 +397,10 @@ async def vitals_batch(req: Request):
 
 @app.post("/v1/state/run")
 def run_state():
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
-        conn.commit()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
+            conn.commit()
 
     return {
         "ok": True,
@@ -375,7 +411,6 @@ def run_state():
 
 @app.post("/v1/trends/run")
 def run_trends():
-    # placeholder para manter compatibilidade com o workflow já existente
     return {
         "ok": True,
         "step": "trends",
@@ -386,7 +421,6 @@ def run_trends():
 
 @app.post("/v1/assist/recommendations/run")
 def run_recommendations():
-    # placeholder para manter compatibilidade com o workflow já existente
     return {
         "ok": True,
         "step": "assist_recommendations",
@@ -397,12 +431,45 @@ def run_recommendations():
 
 # ---------------- TELEGRAM ----------------
 
+@app.get("/v1/notify/telegram/pending")
+def telegram_pending(max_read: int = Query(default=10, ge=1, le=100)):
+    rows = fetch_pending_telegram_alerts(max_send=max_read)
+    return {
+        "ok": True,
+        "count": len(rows),
+        "rows": rows,
+        "version": APP_VERSION
+    }
+
+
+@app.post("/v1/notify/telegram/test")
+def telegram_test(message: str = Query(default="Teste PREVITA Telegram")):
+    result = telegram_send(message)
+    return {
+        "ok": True,
+        "message_sent": message,
+        "telegram_result": result,
+        "version": APP_VERSION
+    }
+
+
 @app.post("/v1/notify/telegram/run")
-def run_telegram(max_send: int = 3):
+def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
     sent = 0
     errors = []
 
-    rows = fetch_pending_telegram_alerts(max_send=max_send)
+    try:
+        rows = fetch_pending_telegram_alerts(max_send=max_send)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "stage": "fetch_pending_telegram_alerts",
+                "error": str(e),
+                "version": APP_VERSION
+            }
+        )
 
     for row in rows:
         try:
@@ -411,7 +478,12 @@ def run_telegram(max_send: int = 3):
             mark_alert_sent(row["cod_atendimento"], row["snapshot_ts"], row["alerta"])
             sent += 1
         except Exception as e:
-            errors.append(str(e))
+            errors.append({
+                "cod_atendimento": row.get("cod_atendimento"),
+                "snapshot_ts": str(row.get("snapshot_ts")),
+                "alerta": row.get("alerta"),
+                "error": str(e)
+            })
 
     return {
         "ok": True,
@@ -434,4 +506,3 @@ async def global_exception_handler(request: Request, exc: Exception):
             "version": APP_VERSION
         }
     )
-
