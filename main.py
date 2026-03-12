@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hashlib
 from datetime import datetime, date, time
 from typing import Any, Dict, List, Optional
 
@@ -11,7 +12,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -92,15 +93,6 @@ def parse_date(v):
     return None
 
 
-def parse_dt(v):
-    if v is None:
-        return None
-    try:
-        return datetime.fromisoformat(str(v))
-    except Exception:
-        return None
-
-
 def build_event_ts(d: date, h: int, m: int):
     return datetime.combine(d, time(h, m))
 
@@ -130,9 +122,6 @@ def abnormal_consciousness(v: Optional[str]) -> bool:
 
 
 def pick_previous_non_null(history: List[Dict[str, Any]], field: str, current_snapshot_ts=None):
-    """
-    Busca valor anterior não nulo ignorando o snapshot atual se ele vier no histórico.
-    """
     for row in history:
         if current_snapshot_ts is not None and str(row.get("event_ts")) == str(current_snapshot_ts):
             continue
@@ -147,7 +136,29 @@ def fmt_delta(current: Optional[float], previous: Optional[float], label: str) -
         return None
     delta = current - previous
     sign = "+" if delta > 0 else ""
+    if label == "Temp":
+        return f"{label} {sign}{delta:.1f}"
     return f"{label} {sign}{delta:.0f}"
+
+
+def compute_alert_hash(row: Dict[str, Any], analysis: Dict[str, Any]) -> str:
+    payload = {
+        "cod_atendimento": row.get("cod_atendimento"),
+        "syndrome": analysis.get("syndrome"),
+        "priority": analysis.get("priority"),
+        "confidence": analysis.get("confidence"),
+        "temp": row.get("temp"),
+        "pas": row.get("pas"),
+        "pad": row.get("pad"),
+        "fc": row.get("fc"),
+        "fr": row.get("fr"),
+        "spo2": row.get("spo2"),
+        "uso_o2": row.get("uso_o2"),
+        "nivel_consciencia": row.get("nivel_consciencia"),
+        "trend_summary": analysis.get("trend_summary", []),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ---------------- POWER BI EXTRACT ----------------
@@ -191,10 +202,7 @@ def telegram_send(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(
         url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text
-        },
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
         timeout=30
     )
 
@@ -202,57 +210,6 @@ def telegram_send(text: str):
         raise RuntimeError(f"Erro Telegram: status={resp.status_code}, body={resp.text}")
 
     return resp.json()
-
-
-def fetch_pending_telegram_alerts(max_send: int = 3):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    cod_atendimento,
-                    snapshot_ts,
-                    temp,
-                    pas,
-                    pad,
-                    fc,
-                    fr,
-                    spo2,
-                    dor,
-                    uso_o2,
-                    nivel_consciencia,
-                    profissional,
-                    alerta
-                FROM public.telegram_alert_queue
-                ORDER BY snapshot_ts ASC
-                LIMIT %s
-                """,
-                (max_send,)
-            )
-            rows = cur.fetchall()
-            result = []
-            for r in rows:
-                if isinstance(r, dict):
-                    result.append(r)
-                else:
-                    cols = [desc[0] for desc in cur.description]
-                    result.append(dict(zip(cols, r)))
-            return result
-
-
-def mark_alert_sent(cod_atendimento: int, snapshot_ts: datetime, alerta: str):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.telegram_alert_log
-                (cod_atendimento, snapshot_ts, alerta)
-                VALUES (%s, %s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                (cod_atendimento, snapshot_ts, alerta)
-            )
-            conn.commit()
 
 
 def fetch_patient_history(cod_atendimento: int, limit: int = 6) -> List[Dict[str, Any]]:
@@ -279,16 +236,69 @@ def fetch_patient_history(cod_atendimento: int, limit: int = 6) -> List[Dict[str
                 """,
                 (cod_atendimento, limit)
             )
-            rows = cur.fetchall()
-            result = []
-            for r in rows:
-                if isinstance(r, dict):
-                    result.append(r)
-                else:
-                    cols = [desc[0] for desc in cur.description]
-                    result.append(dict(zip(cols, r)))
-            return result
+            return cur.fetchall()
 
+
+def fetch_risk_candidates(limit: int = 50) -> List[Dict[str, Any]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cod_atendimento,
+                    snapshot_ts,
+                    temp,
+                    pas,
+                    pad,
+                    fc,
+                    fr,
+                    spo2,
+                    dor,
+                    uso_o2,
+                    nivel_consciencia,
+                    profissional,
+                    alerta
+                FROM public.vitals_risk_view
+                ORDER BY snapshot_ts ASC
+                LIMIT %s
+                """,
+                (limit,)
+            )
+            return cur.fetchall()
+
+
+def alert_already_sent(cod_atendimento: int, alert_hash: str) -> bool:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM public.telegram_alert_log
+                WHERE cod_atendimento = %s
+                  AND alert_hash = %s
+                LIMIT 1
+                """,
+                (cod_atendimento, alert_hash)
+            )
+            return cur.fetchone() is not None
+
+
+def mark_alert_sent(cod_atendimento: int, snapshot_ts: datetime, alerta: str, priority: str, alert_hash: str):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.telegram_alert_log
+                (cod_atendimento, snapshot_ts, alerta, priority, alert_hash)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (cod_atendimento, snapshot_ts, alerta, priority, alert_hash)
+            )
+            conn.commit()
+
+
+# ---------------- ANALISE INTELIGENTE ----------------
 
 def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
     temp = nfloat(row.get("temp"))
@@ -318,8 +328,10 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
     neuro = 0
     reasons = []
 
-    # Respiratório
-    if spo2 is not None and spo2 <= 92:
+    if spo2 is not None and spo2 <= 90:
+        respiratory += 45
+        reasons.append(f"SpO2 criticamente baixa ({spo2:.0f})")
+    elif spo2 is not None and spo2 <= 92:
         respiratory += 35
         reasons.append(f"SpO2 baixa ({spo2:.0f})")
     elif spo2 is not None and spo2 <= 94:
@@ -327,11 +339,14 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         reasons.append(f"SpO2 limítrofe ({spo2:.0f})")
 
     if fr is not None and fr >= 30:
-        respiratory += 35
+        respiratory += 40
         reasons.append(f"FR muito elevada ({fr:.0f})")
     elif fr is not None and fr >= 24:
-        respiratory += 20
+        respiratory += 25
         reasons.append(f"FR elevada ({fr:.0f})")
+    elif fr is not None and fr >= 22:
+        respiratory += 15
+        reasons.append(f"FR discretamente elevada ({fr:.0f})")
 
     if d_spo2 is not None and d_spo2 <= -3:
         respiratory += 15
@@ -341,19 +356,18 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         respiratory += 15
         reasons.append(f"aumento recente de FR (+{d_fr:.0f})")
 
-    # Hemodinâmico
     if pas is not None and pas < 90:
-        hemo += 35
+        hemo += 40
         reasons.append(f"PAS baixa ({pas:.0f})")
     elif pas is not None and pas < 100:
-        hemo += 15
+        hemo += 20
         reasons.append(f"PAS limítrofe ({pas:.0f})")
 
     if fc is not None and fc >= 130:
-        hemo += 35
+        hemo += 40
         reasons.append(f"FC muito elevada ({fc:.0f})")
     elif fc is not None and fc >= 110:
-        hemo += 20
+        hemo += 25
         reasons.append(f"FC elevada ({fc:.0f})")
 
     if d_pas is not None and d_pas <= -20:
@@ -364,7 +378,6 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         hemo += 15
         reasons.append(f"aumento recente de FC (+{d_fc:.0f})")
 
-    # Infeccioso / séptico
     if temp is not None and temp >= 39:
         infectious += 35
         reasons.append(f"hipertermia importante ({temp:.1f})")
@@ -380,12 +393,10 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         infectious += 10
         reasons.append(f"elevação recente de temperatura (+{d_temp:.1f})")
 
-    # Neurológico
     if abnormal_consciousness(consc):
-        neuro += 40
+        neuro += 45
         reasons.append(f"consciência alterada ({consc})")
 
-    # Síndrome principal
     scores = {
         "DETERIORACAO_RESPIRATORIA": respiratory,
         "INSTABILIDADE_HEMODINAMICA": hemo,
@@ -394,21 +405,69 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
     }
 
     syndrome = max(scores, key=scores.get)
-    confidence = min(95, max(scores.values()) + 35)
+    top_score = max(scores.values())
+    confidence = min(99, top_score + 35)
 
-    # Se tudo estiver muito baixo, vira observação
-    if max(scores.values()) < 20:
+    if top_score < 20:
         syndrome = "OBSERVACAO_CLINICA"
         confidence = 50
 
-    if confidence >= 85:
-        level = "ALERTA IMEDIATO"
-    elif confidence >= 70:
-        level = "ALERTA URGENTE"
-    else:
-        level = "ATENCAO"
+    # prioridade
+    priority_points = 0
 
-    actions = []
+    if spo2 is not None and spo2 <= 90:
+        priority_points += 3
+    elif spo2 is not None and spo2 <= 92:
+        priority_points += 2
+    elif spo2 is not None and spo2 <= 94:
+        priority_points += 1
+
+    if fr is not None and fr >= 30:
+        priority_points += 3
+    elif fr is not None and fr >= 24:
+        priority_points += 2
+    elif fr is not None and fr >= 22:
+        priority_points += 1
+
+    if fc is not None and fc >= 130:
+        priority_points += 3
+    elif fc is not None and fc >= 110:
+        priority_points += 2
+
+    if pas is not None and pas < 90:
+        priority_points += 3
+    elif pas is not None and pas < 100:
+        priority_points += 1
+
+    if temp is not None and temp >= 39:
+        priority_points += 2
+    elif temp is not None and temp >= 38.3:
+        priority_points += 1
+
+    if abnormal_consciousness(consc):
+        priority_points += 3
+
+    if d_spo2 is not None and d_spo2 <= -3:
+        priority_points += 1
+    if d_fc is not None and d_fc >= 15:
+        priority_points += 1
+    if d_fr is not None and d_fr >= 5:
+        priority_points += 1
+    if d_pas is not None and d_pas <= -20:
+        priority_points += 1
+
+    if priority_points >= 7:
+        priority = "CRITICA"
+        level = "ALERTA IMEDIATO"
+    elif priority_points >= 4:
+        priority = "ALTA"
+        level = "ALERTA URGENTE"
+    elif priority_points >= 2:
+        priority = "MODERADA"
+        level = "ATENCAO"
+    else:
+        priority = "BAIXA"
+        level = "OBSERVACAO"
 
     if syndrome == "DETERIORACAO_RESPIRATORIA":
         actions = [
@@ -467,6 +526,7 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         "syndrome": syndrome,
         "confidence": int(confidence),
         "level": level,
+        "priority": priority,
         "reasons": reasons[:5],
         "actions": actions,
         "trend_summary": trend_parts
@@ -474,11 +534,12 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
 
 
 def format_intelligent_alert(row: Dict[str, Any], analysis: Dict[str, Any]) -> str:
-    level_emoji = {
-        "ALERTA IMEDIATO": "🚨",
-        "ALERTA URGENTE": "⚠️",
-        "ATENCAO": "🟡"
-    }.get(analysis["level"], "⚠️")
+    priority_emoji = {
+        "CRITICA": "🚨",
+        "ALTA": "⚠️",
+        "MODERADA": "🟡",
+        "BAIXA": "🔵"
+    }.get(analysis["priority"], "⚠️")
 
     trend_text = ""
     if analysis.get("trend_summary"):
@@ -491,10 +552,11 @@ def format_intelligent_alert(row: Dict[str, Any], analysis: Dict[str, Any]) -> s
     actions_text = "\n".join([f"{i+1}) {a}" for i, a in enumerate(analysis["actions"])])
 
     return (
-        f"{level_emoji} PREVITA – {analysis['level']}\n\n"
+        f"{priority_emoji} PREVITA – {analysis['level']}\n\n"
         f"🧾 Atendimento: {row.get('cod_atendimento')}\n"
         f"🕒 Snapshot: {row.get('snapshot_ts')}\n"
         f"🧠 Síndrome: {analysis.get('syndrome')}\n"
+        f"🏷️ Prioridade: {analysis.get('priority')}\n"
         f"📊 Confiança: {analysis.get('confidence')}\n\n"
         f"{trend_text}"
         f"{reasons_text}"
@@ -516,11 +578,7 @@ def format_intelligent_alert(row: Dict[str, Any], analysis: Dict[str, Any]) -> s
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": "previta-api",
-        "version": APP_VERSION
-    }
+    return {"ok": True, "service": "previta-api", "version": APP_VERSION}
 
 
 @app.get("/health")
@@ -680,11 +738,7 @@ def run_state():
             cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
             conn.commit()
 
-    return {
-        "ok": True,
-        "step": "state",
-        "version": APP_VERSION
-    }
+    return {"ok": True, "step": "state", "version": APP_VERSION}
 
 
 @app.post("/v1/trends/run")
@@ -711,15 +765,24 @@ def run_recommendations():
 
 @app.get("/v1/notify/telegram/pending")
 def telegram_pending(max_read: int = Query(default=10, ge=1, le=100)):
-    rows = fetch_pending_telegram_alerts(max_send=max_read)
+    rows = fetch_risk_candidates(limit=max_read)
     enriched = []
 
     for row in rows:
         history = fetch_patient_history(row["cod_atendimento"], limit=6)
         analysis = analyze_patient(row, history)
+
+        if analysis["priority"] not in {"ALTA", "CRITICA"}:
+            continue
+
+        alert_hash = compute_alert_hash(row, analysis)
+        if alert_already_sent(row["cod_atendimento"], alert_hash):
+            continue
+
         enriched.append({
             "row": row,
-            "analysis": analysis
+            "analysis": analysis,
+            "alert_hash": alert_hash
         })
 
     return {
@@ -745,28 +808,51 @@ def telegram_test(message: str = Query(default="Teste PREVITA Telegram")):
 def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
     sent = 0
     errors = []
+    scanned = 0
 
     try:
-        rows = fetch_pending_telegram_alerts(max_send=max_send)
+        rows = fetch_risk_candidates(limit=100)
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={
                 "ok": False,
-                "stage": "fetch_pending_telegram_alerts",
+                "stage": "fetch_risk_candidates",
                 "error": str(e),
                 "version": APP_VERSION
             }
         )
 
     for row in rows:
+        scanned += 1
+        if sent >= max_send:
+            break
+
         try:
             history = fetch_patient_history(row["cod_atendimento"], limit=6)
             analysis = analyze_patient(row, history)
+
+            # envia somente alta e crítica
+            if analysis["priority"] not in {"ALTA", "CRITICA"}:
+                continue
+
+            alert_hash = compute_alert_hash(row, analysis)
+
+            # só envia se mudou algo importante
+            if alert_already_sent(row["cod_atendimento"], alert_hash):
+                continue
+
             msg = format_intelligent_alert(row, analysis)
             telegram_send(msg)
-            mark_alert_sent(row["cod_atendimento"], row["snapshot_ts"], row["alerta"])
+            mark_alert_sent(
+                row["cod_atendimento"],
+                row["snapshot_ts"],
+                row["alerta"],
+                analysis["priority"],
+                alert_hash
+            )
             sent += 1
+
         except Exception as e:
             errors.append({
                 "cod_atendimento": row.get("cod_atendimento"),
@@ -778,7 +864,7 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
     return {
         "ok": True,
         "sent": sent,
-        "pending_read": len(rows),
+        "scanned": scanned,
         "errors": errors,
         "version": APP_VERSION
     }
