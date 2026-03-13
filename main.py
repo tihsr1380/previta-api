@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 
 
-APP_VERSION = "5.3.0"
+APP_VERSION = "5.4.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -87,6 +87,38 @@ def parse_date(v):
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+
+    return None
+
+
+def parse_dt(v):
+    if v is None:
+        return None
+
+    if isinstance(v, datetime):
+        return v
+
+    s = str(v).strip()
+    if not s:
+        return None
+
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(s, fmt)
         except Exception:
             pass
 
@@ -308,7 +340,6 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
     fr = nfloat(row.get("fr"))
     spo2 = nfloat(row.get("spo2"))
     consc = row.get("nivel_consciencia")
-    uso_o2 = row.get("uso_o2")
 
     prev_temp = nfloat(pick_previous_non_null(history, "temp", row.get("snapshot_ts")))
     prev_pas = nfloat(pick_previous_non_null(history, "pas", row.get("snapshot_ts")))
@@ -412,7 +443,6 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         syndrome = "OBSERVACAO_CLINICA"
         confidence = 50
 
-    # prioridade
     priority_points = 0
 
     if spo2 is not None and spo2 <= 90:
@@ -610,21 +640,22 @@ async def vitals_batch(req: Request):
             skipped += 1
             continue
 
-        d = parse_date(r.get("data_lanc"))
-        h = to_int(r.get("hora_lanc"))
-        m = to_int(r.get("minuto_lanc"))
-
-        if not (d and h is not None and m is not None):
+        # NOVA REGRA: usa horario_lancamento como origem oficial
+        event_ts = parse_dt(r.get("horario_lancamento"))
+        if event_ts is None:
             skipped += 1
             continue
 
         normalized.append({
-            "event_ts": build_event_ts(d, h, m),
+            "event_ts": event_ts,
             "cod_atendimento": cod,
             "id_ricadpac": to_int(r.get("id_ricadpac")),
-            "data_lanc": d,
-            "hora_lanc": h,
-            "minuto_lanc": m,
+
+            # derivados do horario_lancamento
+            "data_lanc": event_ts.date(),
+            "hora_lanc": event_ts.hour,
+            "minuto_lanc": event_ts.minute,
+
             "temp": to_float(r.get("temp")),
             "dor": to_float(r.get("dor")),
             "fr": to_float(r.get("fr")),
@@ -695,10 +726,12 @@ async def vitals_batch(req: Request):
                     %(source)s,
                     %(payload)s
                 )
-                ON CONFLICT (cod_atendimento, data_lanc, hora_lanc, minuto_lanc)
+                ON CONFLICT (cod_atendimento, event_ts)
                 DO UPDATE SET
-                    event_ts = COALESCE(EXCLUDED.event_ts, vitals_raw.event_ts),
                     id_ricadpac = COALESCE(EXCLUDED.id_ricadpac, vitals_raw.id_ricadpac),
+                    data_lanc = COALESCE(EXCLUDED.data_lanc, vitals_raw.data_lanc),
+                    hora_lanc = COALESCE(EXCLUDED.hora_lanc, vitals_raw.hora_lanc),
+                    minuto_lanc = COALESCE(EXCLUDED.minuto_lanc, vitals_raw.minuto_lanc),
                     temp = COALESCE(EXCLUDED.temp, vitals_raw.temp),
                     dor = COALESCE(EXCLUDED.dor, vitals_raw.dor),
                     fr = COALESCE(EXCLUDED.fr, vitals_raw.fr),
@@ -832,13 +865,11 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
             history = fetch_patient_history(row["cod_atendimento"], limit=6)
             analysis = analyze_patient(row, history)
 
-            # envia somente alta e crítica
             if analysis["priority"] not in {"ALTA", "CRITICA"}:
                 continue
 
             alert_hash = compute_alert_hash(row, analysis)
 
-            # só envia se mudou algo importante
             if alert_already_sent(row["cod_atendimento"], alert_hash):
                 continue
 
