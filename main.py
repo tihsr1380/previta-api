@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 
 
-APP_VERSION = "5.4.0"
+APP_VERSION = "5.5.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -64,7 +64,7 @@ def to_float(v):
         s = str(v).strip()
         if s == "":
             return None
-        return float(s.replace(",", "."))
+        return None if s.lower() == "null" else float(s.replace(",", "."))
     except Exception:
         return None
 
@@ -96,7 +96,6 @@ def parse_date(v):
 def parse_dt(v):
     if v is None:
         return None
-
     if isinstance(v, datetime):
         return v
 
@@ -104,6 +103,8 @@ def parse_dt(v):
     if not s:
         return None
 
+    # aceita ISO com T, com espaço e Z
+    s = s.replace("Z", "")
     try:
         return datetime.fromisoformat(s)
     except Exception:
@@ -111,11 +112,10 @@ def parse_dt(v):
 
     for fmt in (
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
         "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
     ):
         try:
             return datetime.strptime(s, fmt)
@@ -149,7 +149,7 @@ def abnormal_consciousness(v: Optional[str]) -> bool:
         "rebaixado",
         "agitada",
         "desorientada",
-        "coma"
+        "coma",
     }
 
 
@@ -235,7 +235,7 @@ def telegram_send(text: str):
     resp = requests.post(
         url,
         json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-        timeout=30
+        timeout=30,
     )
 
     if not resp.ok:
@@ -266,12 +266,12 @@ def fetch_patient_history(cod_atendimento: int, limit: int = 6) -> List[Dict[str
                 ORDER BY event_ts DESC
                 LIMIT %s
                 """,
-                (cod_atendimento, limit)
+                (cod_atendimento, limit),
             )
             return cur.fetchall()
 
 
-def fetch_risk_candidates(limit: int = 50) -> List[Dict[str, Any]]:
+def fetch_risk_candidates(limit: int = 50, minutes_back: int = 1440) -> List[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -291,43 +291,103 @@ def fetch_risk_candidates(limit: int = 50) -> List[Dict[str, Any]]:
                     profissional,
                     alerta
                 FROM public.vitals_risk_view
+                WHERE snapshot_ts >= NOW() - (%s * INTERVAL '1 minute')
                 ORDER BY snapshot_ts ASC
                 LIMIT %s
                 """,
-                (limit,)
+                (minutes_back, limit),
             )
             return cur.fetchall()
 
 
-def alert_already_sent(cod_atendimento: int, alert_hash: str) -> bool:
+def get_last_alert_info(cod_atendimento: int) -> Optional[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT 1
+                SELECT
+                    cod_atendimento,
+                    snapshot_ts,
+                    alerta,
+                    priority,
+                    alert_hash,
+                    sent_at,
+                    EXTRACT(EPOCH FROM (NOW() - sent_at)) / 60.0 AS minutes_since
                 FROM public.telegram_alert_log
                 WHERE cod_atendimento = %s
-                  AND alert_hash = %s
+                ORDER BY sent_at DESC
                 LIMIT 1
                 """,
-                (cod_atendimento, alert_hash)
+                (cod_atendimento,),
             )
-            return cur.fetchone() is not None
+            return cur.fetchone()
 
 
-def mark_alert_sent(cod_atendimento: int, snapshot_ts: datetime, alerta: str, priority: str, alert_hash: str):
+def mark_alert_sent(
+    cod_atendimento: int,
+    snapshot_ts: datetime,
+    alerta: str,
+    priority: str,
+    alert_hash: str,
+):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO public.telegram_alert_log
-                (cod_atendimento, snapshot_ts, alerta, priority, alert_hash)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
+                    (cod_atendimento, snapshot_ts, alerta, priority, alert_hash, sent_at)
+                VALUES
+                    (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (cod_atendimento, alert_hash)
+                DO UPDATE SET
+                    snapshot_ts = EXCLUDED.snapshot_ts,
+                    alerta = EXCLUDED.alerta,
+                    priority = EXCLUDED.priority,
+                    sent_at = NOW()
                 """,
-                (cod_atendimento, snapshot_ts, alerta, priority, alert_hash)
+                (cod_atendimento, snapshot_ts, alerta, priority, alert_hash),
             )
             conn.commit()
+
+
+def should_send_alert(row: Dict[str, Any], analysis: Dict[str, Any], alert_hash: str) -> bool:
+    """
+    Regras:
+    - Só ALTA/CRITICA são elegíveis
+    - Se nunca enviou antes -> envia
+    - Se mudou o hash -> envia imediatamente
+    - Se não mudou:
+        CRITICA -> reenvia a cada 10 min
+        ALTA    -> reenvia a cada 20 min
+    - Se melhorou (não é mais ALTA/CRITICA), não envia
+    """
+    priority = analysis.get("priority")
+    if priority not in {"ALTA", "CRITICA"}:
+        return False
+
+    last_info = get_last_alert_info(row["cod_atendimento"])
+    if not last_info:
+        return True
+
+    last_hash = last_info.get("alert_hash")
+    minutes_since = last_info.get("minutes_since")
+    try:
+        minutes_since = float(minutes_since) if minutes_since is not None else None
+    except Exception:
+        minutes_since = None
+
+    # mudou sinais / síndrome / prioridade => envia imediatamente
+    if last_hash != alert_hash:
+        return True
+
+    # mesmo quadro, mas precisa reforçar vigilância
+    if priority == "CRITICA":
+        return minutes_since is None or minutes_since >= 10
+
+    if priority == "ALTA":
+        return minutes_since is None or minutes_since >= 20
+
+    return False
 
 
 # ---------------- ANALISE INTELIGENTE ----------------
@@ -506,7 +566,7 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
             "Respiração: ofertar O2 conforme protocolo; avaliar esforço respiratório.",
             "Elevar cabeceira e checar dispositivo/fluxo de O2.",
             "Reavaliar SpO2/FR em 5–10 min ou antes se piora.",
-            "Acionar médico responsável e considerar time de resposta rápida."
+            "Acionar médico responsável e considerar time de resposta rápida.",
         ]
     elif syndrome == "INSTABILIDADE_HEMODINAMICA":
         actions = [
@@ -515,7 +575,7 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
             "Garantir acesso venoso e considerar expansão volêmica conforme cenário clínico.",
             "Monitorizar continuamente e investigar sinais de choque.",
             "Reavaliar em 5–10 min.",
-            "Acionar médico responsável imediatamente."
+            "Acionar médico responsável imediatamente.",
         ]
     elif syndrome == "RISCO_INFECCIOSO_SEPTICO":
         actions = [
@@ -524,7 +584,7 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
             "Checar perfusão, diurese e estado mental.",
             "Coletar exames conforme protocolo institucional.",
             "Reavaliar em 5–10 min se instabilidade.",
-            "Acionar médico responsável com prioridade."
+            "Acionar médico responsável com prioridade.",
         ]
     elif syndrome == "ALTERACAO_NEUROLOGICA":
         actions = [
@@ -533,14 +593,14 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
             "Garantir via aérea protegida se necessário.",
             "Reavaliar nível de consciência em poucos minutos.",
             "Investigar medicações, hipoxemia e causas metabólicas.",
-            "Acionar médico responsável imediatamente."
+            "Acionar médico responsável imediatamente.",
         ]
     else:
         actions = [
             "Manter observação clínica intensiva.",
             "Repetir sinais vitais em curto intervalo.",
             "Correlacionar com quadro clínico e sintomas.",
-            "Reavaliar tendência nas próximas medições."
+            "Reavaliar tendência nas próximas medições.",
         ]
 
     trend_parts = [
@@ -559,7 +619,7 @@ def analyze_patient(row: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[
         "priority": priority,
         "reasons": reasons[:5],
         "actions": actions,
-        "trend_summary": trend_parts
+        "trend_summary": trend_parts,
     }
 
 
@@ -568,7 +628,7 @@ def format_intelligent_alert(row: Dict[str, Any], analysis: Dict[str, Any]) -> s
         "CRITICA": "🚨",
         "ALTA": "⚠️",
         "MODERADA": "🟡",
-        "BAIXA": "🔵"
+        "BAIXA": "🔵",
     }.get(analysis["priority"], "⚠️")
 
     trend_text = ""
@@ -618,7 +678,7 @@ def health():
         "version": APP_VERSION,
         "database_configured": bool(DATABASE_URL),
         "telegram_token_configured": bool(TELEGRAM_BOT_TOKEN),
-        "telegram_chat_configured": bool(TELEGRAM_CHAT_ID)
+        "telegram_chat_configured": bool(TELEGRAM_CHAT_ID),
     }
 
 
@@ -640,22 +700,26 @@ async def vitals_batch(req: Request):
             skipped += 1
             continue
 
-        # NOVA REGRA: usa horario_lancamento como origem oficial
+        # novo modo: usa horario_lancamento diretamente
         event_ts = parse_dt(r.get("horario_lancamento"))
+
+        # compatibilidade com modo antigo
         if event_ts is None:
-            skipped += 1
-            continue
+            d = parse_date(r.get("data_lanc"))
+            h = to_int(r.get("hora_lanc"))
+            m = to_int(r.get("minuto_lanc"))
+            if not (d and h is not None and m is not None):
+                skipped += 1
+                continue
+            event_ts = build_event_ts(d, h, m)
 
         normalized.append({
             "event_ts": event_ts,
             "cod_atendimento": cod,
             "id_ricadpac": to_int(r.get("id_ricadpac")),
-
-            # derivados do horario_lancamento
             "data_lanc": event_ts.date(),
             "hora_lanc": event_ts.hour,
             "minuto_lanc": event_ts.minute,
-
             "temp": to_float(r.get("temp")),
             "dor": to_float(r.get("dor")),
             "fr": to_float(r.get("fr")),
@@ -668,7 +732,7 @@ async def vitals_batch(req: Request):
             "profissional": r.get("profissional"),
             "received_at": now(),
             "source": "power_automate",
-            "payload": json.dumps(payload, default=str)
+            "payload": json.dumps(payload, default=str),
         })
 
     if not normalized:
@@ -677,7 +741,7 @@ async def vitals_batch(req: Request):
             "received": len(rows),
             "normalized": 0,
             "skipped": skipped,
-            "version": APP_VERSION
+            "version": APP_VERSION,
         }
 
     with db() as conn:
@@ -747,7 +811,7 @@ async def vitals_batch(req: Request):
                     payload = COALESCE(EXCLUDED.payload, vitals_raw.payload),
                     updated_at = NOW()
                 """,
-                normalized
+                normalized,
             )
 
             cur.execute("SELECT public.fn_upsert_vitals_snapshot();")
@@ -758,7 +822,7 @@ async def vitals_batch(req: Request):
         "received": len(rows),
         "normalized": len(normalized),
         "skipped": skipped,
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -780,7 +844,7 @@ def run_trends():
         "ok": True,
         "step": "trends",
         "message": "Tendências são avaliadas dinamicamente no envio do alerta.",
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -790,15 +854,18 @@ def run_recommendations():
         "ok": True,
         "step": "assist_recommendations",
         "message": "As recomendações são geradas dinamicamente na análise clínica.",
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
 # ---------------- TELEGRAM ----------------
 
 @app.get("/v1/notify/telegram/pending")
-def telegram_pending(max_read: int = Query(default=10, ge=1, le=100)):
-    rows = fetch_risk_candidates(limit=max_read)
+def telegram_pending(
+    max_read: int = Query(default=10, ge=1, le=100),
+    minutes_back: int = Query(default=1440, ge=1, le=10080),
+):
+    rows = fetch_risk_candidates(limit=max_read, minutes_back=minutes_back)
     enriched = []
 
     for row in rows:
@@ -809,20 +876,21 @@ def telegram_pending(max_read: int = Query(default=10, ge=1, le=100)):
             continue
 
         alert_hash = compute_alert_hash(row, analysis)
-        if alert_already_sent(row["cod_atendimento"], alert_hash):
+
+        if not should_send_alert(row, analysis, alert_hash):
             continue
 
         enriched.append({
             "row": row,
             "analysis": analysis,
-            "alert_hash": alert_hash
+            "alert_hash": alert_hash,
         })
 
     return {
         "ok": True,
         "count": len(enriched),
         "rows": enriched,
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -833,18 +901,21 @@ def telegram_test(message: str = Query(default="Teste PREVITA Telegram")):
         "ok": True,
         "message_sent": message,
         "telegram_result": result,
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
 @app.post("/v1/notify/telegram/run")
-def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
+def run_telegram(
+    max_send: int = Query(default=3, ge=1, le=100),
+    minutes_back: int = Query(default=1440, ge=1, le=10080),
+):
     sent = 0
     errors = []
     scanned = 0
 
     try:
-        rows = fetch_risk_candidates(limit=100)
+        rows = fetch_risk_candidates(limit=100, minutes_back=minutes_back)
     except Exception as e:
         return JSONResponse(
             status_code=500,
@@ -852,8 +923,8 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
                 "ok": False,
                 "stage": "fetch_risk_candidates",
                 "error": str(e),
-                "version": APP_VERSION
-            }
+                "version": APP_VERSION,
+            },
         )
 
     for row in rows:
@@ -870,17 +941,18 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
 
             alert_hash = compute_alert_hash(row, analysis)
 
-            if alert_already_sent(row["cod_atendimento"], alert_hash):
+            if not should_send_alert(row, analysis, alert_hash):
                 continue
 
             msg = format_intelligent_alert(row, analysis)
             telegram_send(msg)
+
             mark_alert_sent(
                 row["cod_atendimento"],
                 row["snapshot_ts"],
                 row["alerta"],
                 analysis["priority"],
-                alert_hash
+                alert_hash,
             )
             sent += 1
 
@@ -889,7 +961,7 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
                 "cod_atendimento": row.get("cod_atendimento"),
                 "snapshot_ts": str(row.get("snapshot_ts")),
                 "alerta": row.get("alerta"),
-                "error": str(e)
+                "error": str(e),
             })
 
     return {
@@ -897,7 +969,7 @@ def run_telegram(max_send: int = Query(default=3, ge=1, le=100)):
         "sent": sent,
         "scanned": scanned,
         "errors": errors,
-        "version": APP_VERSION
+        "version": APP_VERSION,
     }
 
 
@@ -910,6 +982,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={
             "ok": False,
             "error": str(exc),
-            "version": APP_VERSION
-        }
+            "version": APP_VERSION,
+        },
     )
